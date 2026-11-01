@@ -1,5 +1,9 @@
 # aether-child-sandboxing
 
+> **Status: a design for discussion, not a working sandbox.** The guests
+> below run uncontained today; see "The proposed API" and the questions at
+> the end.
+
 An Aether host runs a guest language **in a separate, sandboxed child
 process** and talks to it both ways over `std.ipc`. The guest gets one
 socket and nothing else, and asks the host for what it needs. A file comes
