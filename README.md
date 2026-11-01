@@ -2,7 +2,7 @@
 
 > **Status: a design for discussion, not a working sandbox.** The guests
 > below run uncontained today; see "The proposed API" and the questions at
-> the end.
+> the end. Discussion: [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
 An Aether host runs a guest language **in a separate, sandboxed child
 process** and talks to it both ways over `std.ipc`. The guest gets one
@@ -180,6 +180,9 @@ neither needs root or user namespaces.
 
 ## Questions for Nic and Adil
 
+Also filed, as a proposal that may be declined, in
+[aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
+
 1. **Name and home.** Should it be `os.run_socket_sandboxed(perms, ...)`,
    `sandbox.spawn_socket(perms, ...)`, or an optional `perms` argument on
    `os.run_socket`?
@@ -215,7 +218,8 @@ neither needs root or user namespaces.
 - `send` and `reply` are reserved words (actors), so the natural names for
   protocol code fail to compile. Here they are `tell` and `hear`.
 - `ae build --lib X` replaces the default `lib/` search path, so a program
-  that uses a compiled library *and* a local module needs `--lib lib --lib X`.
+  that uses a compiled library *and* a local module needs `--lib lib --lib X`
+  ([aether#3504](https://github.com/aether-lang-dev/aether/issues/3504)).
 - A closure passed as `fn` has no known result type, so the caller writes
   `string path = policy(name)`.
 - RexxAE ends a `WHEN ... THEN DO` block at the next `WHEN` or `OTHERWISE`,
