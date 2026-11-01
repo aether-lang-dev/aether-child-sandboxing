@@ -1,0 +1,171 @@
+// childbox: what an Aether host needs to talk to a guest it has put in a
+// sandboxed child process. Shared by the RexxAE and the Python showcase.
+//
+// Three parts:
+//   - Wire: newline-framed text messages over a std.ipc socket channel,
+//     plus the handshake that hands the guest an open file descriptor.
+//   - converse: the host's side of the showcase conversation, the same for
+//     every guest language.
+//   - spawn_guest: the stand-in for the sandboxed spawn this repo proposes.
+//     Aether does not have it yet; see README.md, "The proposed API".
+
+exports(Wire, wire_new, tell, hear, grant_fd, take_fd, spawn_guest, converse)
+
+import std.io
+import std.ipc
+import std.list
+import std.os
+import std.sandbox
+import std.string
+
+// A channel, and what has arrived on it past the last message read.
+struct Wire {
+    ch: int
+    pending: string
+}
+
+wire_new(ch: int) -> Wire {
+    return Wire { ch: ch, pending: "" }
+}
+
+// Sends one message: a line of text, without its newline.
+tell(w: *Wire, line: string) -> string {
+    return ipc.write(w.ch, "${line}\n")
+}
+
+// The next message, without its newline, however its bytes arrive.
+// ("", "end of stream") when the other side has closed.
+hear(w: *Wire) -> (string, string) {
+    while true {
+        at = string.index_of(w.pending, "\n")
+        if at >= 0 {
+            line = string.substring(w.pending, 0, at)
+            w.pending = string.substring(w.pending, at + 1, string.length(w.pending))
+            return line, ""
+        }
+        part, err = ipc.read(w.ch, 4096)
+        if err != "" { return "", err }
+        if string.length(part) == 0 { return "", "end of stream" }
+        w.pending = string.concat(w.pending, part)
+    }
+}
+
+// Passing a descriptor is three steps, not one (see README, "Questions"):
+//   host  -> guest   GRANT <name>       a plain message
+//   guest -> host    TAKE <name>        "my next read is the descriptor"
+//   host  -> guest   <descriptor>       ipc.send_fd, payload <name>
+// A plain read that met the descriptor's bytes would drop the descriptor,
+// and ipc.recv_fd refuses a message that has none, so the guest says when
+// it is about to take one.
+
+// The host's half: answers GRANT, waits for TAKE, passes `fd`.
+grant_fd(w: *Wire, name: string, fd: int) -> string {
+    err = tell(w, "GRANT ${name}")
+    if err != "" { return err }
+    take, rerr = hear(w)
+    if rerr != "" { return rerr }
+    if take != "TAKE ${name}" { return "expected 'TAKE ${name}', got '${take}'" }
+    return ipc.send_fd(w.ch, fd, name)
+}
+
+// The guest's half, for a guest written in Aether: says TAKE, then takes
+// the descriptor. Only valid with nothing unread pending.
+take_fd(w: *Wire, name: string) -> (int, string) {
+    if string.length(w.pending) != 0 { return -1, "unread bytes before a descriptor" }
+    err = tell(w, "TAKE ${name}")
+    if err != "" { return -1, err }
+    fd, payload, ferr = ipc.recv_fd(w.ch, 256)
+    if ferr != "" { return -1, ferr }
+    if payload != name {
+        io.fd_close(fd)
+        return -1, "descriptor came for '${payload}', not '${name}'"
+    }
+    return fd, ""
+}
+
+// THE STAND-IN. The API this repo proposes is
+//
+//     os.run_socket_sandboxed(perms, prog, argv, env) -> (fd, pid, err)
+//
+// os.run_socket's channel plus spawn_sandboxed's containment: the child
+// starts with libaether_sandbox.so preloaded and the kernel filters
+// installed, held to `perms`. Aether does not have it yet, so this runs
+// the guest with plain os.run_socket: same channel, NO containment. It
+// says so on every run, and the guest's probes report what they got.
+spawn_guest(perms: sandbox.Grants, prog: string, argv: ptr) -> (int, int, string) {
+    println("[childbox] stand-in spawn: os.run_socket, the guest is NOT contained yet")
+    return os.run_socket(prog, argv, null)
+}
+
+// Prints one message of the conversation with its direction.
+show(from: string, to: string, line: string) {
+    println("  ${from} -> ${to}  ${line}")
+}
+
+// The host's side of the showcase, the same for every guest:
+//
+//   host  HELLO              guest HELLO
+//   host  ASK multiply 6 7   guest ANSWER 42
+//                            guest REQUEST config    host GRANT, fd passed
+//                            guest SAY <from the file>
+//                            guest REQUEST /etc/passwd  host DENY
+//                            guest PROBE <its own escape attempts>
+//                            guest DONE
+//   host  BYE                guest BYE
+//
+// Either side starts exchanges: the host asks the guest a question, and
+// the guest asks the host for files. `policy` maps a name the guest may
+// ask for to a path on the host's disk, or "" for no.
+converse(ch: int, guest: string, policy: fn) -> string {
+    w = wire_new(ch)
+    hello = "HELLO from the Aether host"
+    show("host", guest, hello)
+    err = tell(&w, hello)
+    if err != "" { return err }
+    while true {
+        line, rerr = hear(&w)
+        if rerr != "" { return "guest went away: ${rerr}" }
+        show(guest, "host", line)
+        verb, rest = split_verb(line)
+        if verb == "HELLO" {
+            ask = "ASK multiply 6 7"
+            show("host", guest, ask)
+            err = tell(&w, ask)
+        } else if verb == "REQUEST" {
+            err = answer_request(&w, guest, rest, policy)
+        } else if verb == "DONE" {
+            show("host", guest, "BYE")
+            err = tell(&w, "BYE")
+        } else if verb == "BYE" {
+            return ""
+        }
+        if err != "" { return err }
+    }
+}
+
+// GRANT and pass the file, or DENY.
+answer_request(w: *Wire, guest: string, name: string, policy: fn) -> string {
+    string path = policy(name)
+    if path == "" {
+        deny = "DENY ${name}: not in this guest's policy"
+        show("host", guest, deny)
+        return tell(w, deny)
+    }
+    fd, oerr = io.fd_open_read(path)
+    if oerr != "" {
+        deny = "DENY ${name}: ${oerr}"
+        show("host", guest, deny)
+        return tell(w, deny)
+    }
+    show("host", guest, "GRANT ${name}   (then ${path} as an open descriptor)")
+    err = grant_fd(w, name, fd)
+    io.fd_close(fd)
+    return err
+}
+
+// "VERB the rest" -> ("VERB", "the rest").
+split_verb(line: string) -> (string, string) {
+    at = string.index_of(line, " ")
+    if at < 0 { return line, "" }
+    return string.substring(line, 0, at), string.substring(line, at + 1, string.length(line))
+}

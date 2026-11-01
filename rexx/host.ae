@@ -1,0 +1,39 @@
+// The RexxAE showcase's host: runs the Rexx guest (build/rexx-guest, the
+// worker around rexx/chat.rexx) in a sandboxed child and talks to it, both
+// ways, over std.ipc. The same conversation as python/host.ae, line for
+// line; only the guest differs.
+//
+// Run (from the repo root): make rexx
+
+import std.list
+import std.os
+import std.sandbox
+import childbox
+
+main() {
+    // What the guest may do on its own: read its script. Nothing else:
+    // no files of ours, no network, no processes.
+    guest = sandbox.new("rexx-guest") {
+        grant_fs_read("rexx/chat.rexx")
+    }
+    defer sandbox.free(guest)
+
+    // What the guest may ASK for: one logical name, mapped to a file here.
+    policy = |name: string| {
+        if name == "config" { return "data/config.txt" }
+        return ""
+    }
+
+    argv = list.new()
+    ch, pid, err = childbox.spawn_guest(guest, "build/rexx-guest", argv)
+    list.free(argv)
+    if err != "" {
+        println("spawn failed: ${err}")
+        exit(1)
+    }
+
+    println("conversation:")
+    cerr = childbox.converse(ch, "rexx", policy)
+    if cerr != "" { println("conversation failed: ${cerr}") }
+    os.wait_pid(pid)
+}

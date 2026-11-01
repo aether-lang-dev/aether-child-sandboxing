@@ -1,0 +1,116 @@
+// The RexxAE showcase's guest: an Aether worker that runs rexx/chat.rexx
+// on the RexxAE engine, in the sandboxed child process.
+//
+// RexxAE has no system API: every effect a script wants is an event the
+// host of the engine answers. In-process, that host is an application.
+// Here it is this small worker, and it answers each event with a message
+// on the socket, so the application deciding is the parent, in another
+// process. Two walls, then: the engine's own (no ADDRESS SYSTEM, no
+// files), and the process's (the sandbox, once the proposed spawn exists),
+// which also holds if the engine itself has a bug.
+//
+// Built by the Makefile against RexxAE's Aether library (`make rexx`).
+
+import std.fs
+import std.io
+import std.ipc
+import std.string
+import std.tcp
+import rexxae
+import childbox
+
+const SCRIPT = "rexx/chat.rexx"
+
+// A Rexx string as a JSON string, for typed replies.
+json_str(s: string) -> string {
+    out = string.replace_all(s, "\\", "\\\\")
+    out = string.replace_all(out, "\"", "\\\"")
+    return "\"${out}\""
+}
+
+// HOST_REQUEST(name): ask, then take the descriptor and read the file.
+request(w: *childbox.Wire, name: string) -> string {
+    err = childbox.tell(w, "REQUEST ${name}")
+    if err != "" { return "{\"granted\":false,\"why\":${json_str(err)}}" }
+    answer, rerr = childbox.hear(w)
+    if rerr != "" { return "{\"granted\":false,\"why\":${json_str(rerr)}}" }
+    if answer != "GRANT ${name}" {
+        why = string.substring(answer, 5, string.length(answer))
+        return "{\"granted\":false,\"why\":${json_str(why)}}"
+    }
+    fd, ferr = childbox.take_fd(w, name)
+    if ferr != "" { return "{\"granted\":false,\"why\":${json_str(ferr)}}" }
+    text, _n, _rerr = io.fd_read_n(fd, 4096)
+    io.fd_close(fd)
+    return "{\"granted\":true,\"text\":${json_str(string.trim(text))}}"
+}
+
+// The worker's own escape attempts: what a bug in the engine could try.
+// These go through std, and so through libc, where the proposed spawn's
+// preload refuses them.
+worker_probes(w: *childbox.Wire) {
+    _, ferr = fs.read("/etc/passwd")
+    got = if ferr == "" { "ALLOWED" } else { "refused (${ferr})" }
+    childbox.tell(w, "PROBE worker fs.read('/etc/passwd'): ${got}")
+    conn, cerr = tcp.connect("1.1.1.1", 443)
+    if cerr == "" {
+        tcp.close(conn)
+        childbox.tell(w, "PROBE worker tcp.connect 1.1.1.1:443: ALLOWED")
+    } else {
+        childbox.tell(w, "PROBE worker tcp.connect 1.1.1.1:443: refused (${cerr})")
+    }
+}
+
+main() {
+    ch = ipc.parent_channel()
+    if ch < 0 {
+        println("rexx guest: no parent channel; run rexx/host.ae instead")
+        exit(1)
+    }
+    w = childbox.wire_new(ch)
+    source, serr = fs.read(SCRIPT)
+    if serr != "" {
+        childbox.tell(&w, "BYE cannot read ${SCRIPT}: ${serr}")
+        exit(1)
+    }
+
+    ctx = rexxae.rexxae_create(source)
+    defer rexxae.rexxae_destroy(ctx)
+    rexxae.rexxae_register_function(ctx, "HOST_HEAR", 0, 0)
+    rexxae.rexxae_register_function(ctx, "HOST_TELL", 1, 1)
+    rexxae.rexxae_register_function(ctx, "HOST_REQUEST", 1, 1)
+    rexxae.rexxae_register_function(ctx, "WORKER_PROBES", 0, 0)
+
+    while true {
+        status = rexxae.rexxae_step(ctx, 1000)
+        if status == 0 { exit(rexxae.rexxae_exit_code(ctx)) }
+        if status == -1 {
+            err = string.copy(rexxae.rexxae_error(ctx))
+            childbox.tell(&w, "SAY rexx error: ${err}")
+            exit(1)
+        }
+        if status == 1 {
+            childbox.tell(&w, "SAY ${string.copy(rexxae.rexxae_text(ctx))}")
+        } else if status == 2 {
+            // ADDRESS: no environment is mounted, so every command is vetoed.
+            address = string.copy(rexxae.rexxae_address(ctx))
+            rexxae.rexxae_reply(ctx, 1, "", "ADDRESS ${address} is not mounted")
+        } else if status == 4 {
+            name = string.copy(rexxae.rexxae_function(ctx))
+            if name == "HOST_HEAR" {
+                line, herr = childbox.hear(&w)
+                if herr != "" { exit(1) }
+                rexxae.rexxae_reply_value(ctx, json_str(line), "")
+            } else if name == "HOST_TELL" {
+                childbox.tell(&w, string.copy(rexxae.rexxae_argument_text(ctx, 0)))
+                rexxae.rexxae_reply_value(ctx, "true", "")
+            } else if name == "HOST_REQUEST" {
+                asked = string.copy(rexxae.rexxae_argument_text(ctx, 0))
+                rexxae.rexxae_reply_value(ctx, request(&w, asked), "")
+            } else if name == "WORKER_PROBES" {
+                worker_probes(&w)
+                rexxae.rexxae_reply_value(ctx, "true", "")
+            }
+        }
+    }
+}

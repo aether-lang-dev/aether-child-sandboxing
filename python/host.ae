@@ -1,0 +1,45 @@
+// The Python showcase's host: runs python/guest.py in a sandboxed child
+// and talks to it, both ways, over std.ipc.
+//
+// The guest is the stock python3 with nothing added: no Aether bridge, no
+// liblua-style ABI to match. It gets one thing, the socket at fd 3, and
+// asks the host for everything else.
+//
+// Run (from the repo root): ae run python/host.ae
+
+import std.list
+import std.os
+import std.sandbox
+import childbox
+
+main() {
+    // What the guest may do on its own: read the interpreter's own library,
+    // so python3 can start and import its standard modules. Nothing else:
+    // no files of ours, no network, no processes. (Which grants an
+    // interpreter needs to start is an open question: README, "Questions".)
+    guest = sandbox.new("python-guest") {
+        grant_fs_read("/usr/lib/python3*")
+        grant_fs_read("/opt/homebrew/Frameworks/Python.framework/*")
+    }
+    defer sandbox.free(guest)
+
+    // What the guest may ASK for: one logical name, mapped to a file here.
+    policy = |name: string| {
+        if name == "config" { return "data/config.txt" }
+        return ""
+    }
+
+    argv = list.new()
+    list.add(argv, "python/guest.py")
+    ch, pid, err = childbox.spawn_guest(guest, "python3", argv)
+    list.free(argv)
+    if err != "" {
+        println("spawn failed: ${err}")
+        exit(1)
+    }
+
+    println("conversation:")
+    cerr = childbox.converse(ch, "python", policy)
+    if cerr != "" { println("conversation failed: ${cerr}") }
+    os.wait_pid(pid)
+}
