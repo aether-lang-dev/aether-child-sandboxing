@@ -1,6 +1,7 @@
 // The RexxAE showcase's host: runs the Rexx guest (build/rexx-guest, the
-// worker around rexx/chat.rexx) in a sandboxed child and talks to it, both
-// ways, over std.ipc. The same conversation as python/host.ae, line for
+// worker around rexx/chat.rexx) in a child process and talks to it, both
+// ways, over std.ipc. The child is meant to be sandboxed; it will be once
+// the proposed spawn exists (README, "What's left"). The same conversation as python/host.ae, line for
 // line; only the guest differs.
 //
 // Run (from the repo root): make rexx
@@ -13,6 +14,7 @@ import childbox
 main() {
     // What the guest may do on its own: read its script. Nothing else:
     // no files of ours, no network, no processes.
+    // NOT ENFORCED YET: the stand-in spawn takes these grants and ignores them.
     guest = sandbox.new("rexx-guest") {
         grant_fs_read("rexx/chat.rexx")
     }

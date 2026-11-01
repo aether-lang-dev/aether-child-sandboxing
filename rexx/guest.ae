@@ -1,5 +1,6 @@
 // The RexxAE showcase's guest: an Aether worker that runs rexx/chat.rexx
-// on the RexxAE engine, in the sandboxed child process.
+// on the RexxAE engine, in the child process (sandboxed once the proposed
+// spawn exists).
 //
 // RexxAE has no system API: every effect a script wants is an event the
 // host of the engine answers. In-process, that host is an application.

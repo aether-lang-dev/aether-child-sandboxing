@@ -1,5 +1,6 @@
-// The Python showcase's host: runs python/guest.py in a sandboxed child
-// and talks to it, both ways, over std.ipc.
+// The Python showcase's host: runs python/guest.py in a child process and
+// talks to it, both ways, over std.ipc. The child is meant to be sandboxed;
+// it will be once the proposed spawn exists (README, "What's left").
 //
 // The guest is the stock python3 with nothing added: no Aether bridge, no
 // liblua-style ABI to match. It gets one thing, the socket at fd 3, and
@@ -17,6 +18,7 @@ main() {
     // so python3 can start and import its standard modules. Nothing else:
     // no files of ours, no network, no processes. (Which grants an
     // interpreter needs to start is an open question: README, "Questions".)
+    // NOT ENFORCED YET: the stand-in spawn takes these grants and ignores them.
     guest = sandbox.new("python-guest") {
         grant_fs_read("/usr/lib/python3*")
         grant_fs_read("/opt/homebrew/Frameworks/Python.framework/*")

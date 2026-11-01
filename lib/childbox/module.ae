@@ -1,5 +1,6 @@
 // childbox: what an Aether host needs to talk to a guest it has put in a
-// sandboxed child process. Shared by the RexxAE and the Python showcase.
+// child process (sandboxed once the proposed spawn exists). Shared by the
+// RexxAE and the Python showcase.
 //
 // Three parts:
 //   - Wire: newline-framed text messages over a std.ipc socket channel,

@@ -23,6 +23,39 @@ clearly marked stand-in here (see "The proposed API"). So today the guests
 are *not* contained, and their escape probes say `ALLOWED`. Nothing in
 Aether was changed for this repo.
 
+## What's coded, what's left
+
+**Coded, and working today:**
+
+- The two-way conversation over `std.ipc`, on the socketpair that
+  `os.run_socket` sets up (fd 3 in the child).
+- Line framing, and handing a granted file over as an open descriptor
+  (`GRANT`, then `TAKE`, then `ipc.send_fd`).
+- The host's policy: the guest asks for a file by name, and the host grants
+  or refuses it.
+- Both guests: `python/guest.py`, and `rexx/chat.rexx` with its worker
+  (`rexx/guest.ae`) and three mounted functions.
+- The escape probes, which report honestly what gets through.
+- RexxAE's own wall: with no `ADDRESS` environment mounted,
+  `ADDRESS SYSTEM` gets RC 1. That part is real now.
+
+**Left to do, all of it in Aether:**
+
+1. **The sandboxed socket spawn** (`os.run_socket_sandboxed` or another
+   name, question 1). Until it exists the guests are not contained, and
+   the grants in `python/host.ae` and `rexx/host.ae` are built, handed to
+   the stand-in `childbox.spawn_guest`, and ignored.
+2. **A kernel layer:** Landlock and a wider seccomp filter. Without it, the
+   Python raw-syscall probe gets through even the preload (question 5).
+3. **Interpreter start-up grants**, so `python3` can read its own library
+   without paths written per platform (question 4).
+4. **Optional improvements:** a single receive that returns data and an
+   optional descriptor, which would remove the `TAKE` step (question 2);
+   framed messages in `std.ipc` (question 3); a declarative policy
+   (question 6).
+5. **macOS and Windows:** what the spawn does there is undecided
+   (question 7).
+
 ## Run it
 
 You need an Aether toolchain, a RexxAE checkout next to this one
