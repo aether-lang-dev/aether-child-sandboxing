@@ -1,12 +1,14 @@
-// The Python showcase's host: runs python/guest.py in a child process and
-// talks to it, both ways, over std.ipc. The child is meant to be sandboxed;
-// it will be once the proposed spawn exists (README, "What's left").
+// The Python showcase's host: runs python/guest.py in a sandboxed child
+// process (sandbox.spawn_socket) and talks to it, both ways, over std.ipc.
 //
 // The guest is the stock python3 with nothing added: no Aether bridge, no
-// liblua-style ABI to match. It gets one thing, the socket at fd 3, and
-// asks the host for everything else.
+// libpython ABI to match. It gets one thing, the socket at fd 3, and asks
+// the host for everything else.
 //
-// Run (from the repo root): ae run python/host.ae
+// Run (from the repo root): make python
+//   args: [stall] [uncontained]
+//   stall        the guest goes quiet after HELLO: the deadline kills it
+//   uncontained  sandbox.spawn_socket_uncontained, by name (make UNCONTAINED=1)
 
 import std.io
 import std.list
@@ -14,16 +16,24 @@ import std.os
 import std.sandbox
 import childbox
 
+const GUEST = "python/guest.py"
+
 main() {
+    stall = 0
+    uncontained = 0
+    i = 1
+    while i < os.args_count() {
+        if os.args_get(i) == "stall" { stall = 1 }
+        if os.args_get(i) == "uncontained" { uncontained = 1 }
+        i = i + 1
+    }
+
     // What the guest may do on its own: read the interpreter's own library,
-    // so python3 can start and import its standard modules. Nothing else:
-    // no files of ours, no network, no processes. (Which grants an
-    // interpreter needs to start is an open question: README, "Questions".)
-    // NOT ENFORCED YET: sandbox.spawn_socket would hold the child to these;
-    // the uncontained stand-in below takes them and ignores them.
+    // which python3 itself is asked for (no platform paths here), and its
+    // script. Nothing else: no files of ours, no network, no processes.
     guest = sandbox.new("python-guest") {
-        grant_fs_read("/usr/lib/python3*")
-        grant_fs_read("/opt/homebrew/Frameworks/Python.framework/*")
+        grant_runtime("python3")
+        grant_fs_read("${os.getcwd()}/${GUEST}")
     }
     defer sandbox.free(guest)
 
@@ -33,23 +43,31 @@ main() {
         return ""
     }
 
+    session = if stall == 1 { "python-stall" } else { "python" }
+    childbox.audit_log("--- session: ${session}")
     argv = list.new()
-    list.add(argv, "python/guest.py")
-    ch, pid, err = childbox.spawn_socket_uncontained(guest, "python3", argv)
+    list.add(argv, "-I")
+    list.add(argv, GUEST)
+    if stall == 1 { list.add(argv, "stall") }
+    ch, pid, err = childbox.start_guest(guest, "python3", argv, uncontained)
     list.free(argv)
     if err != "" {
-        println("spawn failed: ${err}")
+        println("spawn refused: ${err}")
         exit(1)
     }
 
     println("conversation (permission decisions also go to ${childbox.AUDIT_LOG}):")
-    cerr = childbox.converse(ch, "python", policy)
+    cerr = childbox.converse(ch, session, policy)
     if cerr != "" {
-        // A guest that broke the protocol may still be writing: hang up and
-        // stop it, rather than wait on a child blocked on a full socket.
-        println("conversation failed: ${cerr}")
+        // A guest that broke the protocol or went quiet may still be
+        // running: hang up and stop it rather than wait on it.
+        println("conversation ended: ${cerr}")
         io.fd_close(ch)
         os.kill(pid, 9)
+        childbox.audit_log("${session} KILLED after: ${cerr}")
+        println("  host: guest killed")
+    } else {
+        io.fd_close(ch)
     }
     os.wait_pid(pid)
 }

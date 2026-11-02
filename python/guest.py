@@ -12,37 +12,35 @@ import socket
 import sys
 
 ch = socket.socket(fileno=int(os.environ["AETHER_IPC_FD"]))
-pending = b""
 
-# Framing, the same as lib/childbox: the length in bytes in decimal, a
-# colon, then the bytes. At most MAX_FRAME bytes a message.
+# Framing, std.ipc's: a 4-byte big-endian length, then the bytes. At most
+# MAX_FRAME bytes a message. Reads take exactly a frame and never a byte
+# more, so a descriptor riding on the byte after a GRANT frame is left for
+# recv_fds.
 MAX_FRAME = 65536
-MAX_HEADER = 6
 
 
 def send(msg):
     data = msg.encode()
     assert len(data) <= MAX_FRAME, "message over MAX_FRAME"
-    ch.sendall(str(len(data)).encode() + b":" + data)
+    ch.sendall(len(data).to_bytes(4, "big") + data)
+
+
+def read_exact(n):
+    got = b""
+    while len(got) < n:
+        part = ch.recv(n - len(got))
+        if not part:
+            sys.exit("host went away")
+        got += part
+    return got
 
 
 def recv():
-    global pending
-    while True:
-        head, colon, rest = pending.partition(b":")
-        if colon:
-            if not head.isdigit() or len(head) >= MAX_HEADER or int(head) > MAX_FRAME:
-                sys.exit("bad frame from the host")
-            size = int(head)
-            if len(rest) >= size:
-                pending = rest[size:]
-                return rest[:size].decode()
-        elif len(pending) >= MAX_HEADER:
-            sys.exit("bad frame from the host")
-        part = ch.recv(4096)
-        if not part:
-            sys.exit("host went away")
-        pending += part
+    size = int.from_bytes(read_exact(4), "big")
+    if size > MAX_FRAME:
+        sys.exit("frame from the host over MAX_FRAME")
+    return read_exact(size).decode()
 
 
 def request(name):
@@ -52,10 +50,9 @@ def request(name):
     if reply.startswith("DENY "):
         return None, reply[5:]
     assert reply == f"GRANT {name}", reply
-    assert not pending, "unread bytes before a descriptor"
-    send(f"TAKE {name}")
-    payload, fds, _flags, _addr = socket.recv_fds(ch, 256, 1)
-    assert payload.decode() == name and len(fds) == 1
+    # The descriptor rides on the next byte: one recvmsg takes both.
+    payload, fds, _flags, _addr = socket.recv_fds(ch, 1, 1)
+    assert payload == b"F" and len(fds) == 1
     with os.fdopen(fds[0]) as f:
         return f.read().strip(), ""
 
@@ -80,10 +77,22 @@ def probe_raw_syscall(path):
     if SYS_openat is None:
         return f"skipped (no openat number for {os.uname().machine})"
     AT_FDCWD = -100
-    # libc opened by name, not CDLL(None): the global lookup would find the
-    # sandbox preload's own syscall() first, and that refuses. This is the
-    # call a guest uses to go round the preload entirely.
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    # libc's own syscall(), not the global lookup (CDLL(None)), which finds
+    # the sandbox preload's syscall() first, and that refuses. The preload
+    # also refuses dlopen("libc.so.6") by that name, so a guest names the
+    # file instead: one of these is where the loader found libc. This is
+    # the call a guest uses to go round the preload entirely.
+    libc = None
+    for candidate in ("/usr/lib/libc.so.6", "/usr/lib64/libc.so.6",
+                      "/lib/x86_64-linux-gnu/libc.so.6",
+                      "/lib/aarch64-linux-gnu/libc.so.6", "/lib64/libc.so.6"):
+        try:
+            libc = ctypes.CDLL(candidate, use_errno=True)
+            break
+        except OSError:
+            pass
+    if libc is None:
+        return "skipped (could not load libc by path)"
     fd = libc.syscall(SYS_openat, AT_FDCWD, path.encode(), os.O_RDONLY)
     if fd >= 0:
         os.close(fd)
@@ -99,11 +108,17 @@ def probe_connect():
         return f"refused ({e.strerror or e})"
 
 
+stall = "stall" in sys.argv[1:]
+
 while True:
     msg = recv()
     verb, _, rest = msg.partition(" ")
     if verb == "HELLO":
         send(f"HELLO from Python {sys.version.split()[0]}")
+        if stall:
+            # A guest that stops answering: the host's deadline ends it.
+            import time
+            time.sleep(3600)
     elif verb == "ASK":
         op, a, b = rest.split()
         send(f"ANSWER {int(a) * int(b)}" if op == "multiply" else f"ANSWER ? {op}")

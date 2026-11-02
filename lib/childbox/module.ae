@@ -1,20 +1,23 @@
 // childbox: what an Aether host needs to talk to a guest it has put in a
-// child process (sandboxed once the proposed spawn exists). Shared by the
-// RexxAE and the Python showcase.
+// sandboxed child process (sandbox.spawn_socket). Shared by the Python and
+// the RexxAE showcase.
 //
 // Four parts:
-//   - Wire: length-prefixed messages over a std.ipc socket channel, with a
-//     maximum frame size, plus the handshake that hands the guest an open
-//     file descriptor.
-//   - converse: the host's side of the showcase conversation, the same for
-//     every guest language.
+//   - start_guest: sandbox.spawn_socket, failing closed, or, only when the host
+//     asks for it by name, sandbox.spawn_socket_uncontained.
+//   - Wire: std.ipc's length-prefixed frames (a 4-byte big-endian length,
+//     then the bytes, at most MAX_FRAME), each read bounded by a deadline,
+//     and a granted file handed over as an open descriptor.
+//   - The host's half of the showcase conversation, the same for every
+//     guest language: respond (what the host says to a guest's line) and
+//     converse (the whole exchange over frames, for a guest that speaks them
+//     itself, such as python/guest.py).
 //   - audit_log: one log for both kinds of permission, the host's GRANTs
-//     and DENYs and what the guest's own sandbox reports.
-//   - spawn_socket_uncontained: the stand-in for sandbox.spawn_socket, the
-//     spawn this repo proposes (aether#3503). Aether does not have it yet.
+//     and DENYs, timeouts and kills, and what the guest's own sandbox
+//     reports.
 
-exports(Wire, wire_new, tell, hear, grant_fd, take_fd, spawn_socket_uncontained,
-        converse, audit_log, printable, MAX_FRAME, AUDIT_LOG)
+exports(start_guest, tell, hear, grant_fd, respond, converse, audit_log, printable,
+        show, split_verb, MAX_FRAME, DEADLINE_MS, AUDIT_LOG)
 
 import std.io
 import std.ipc
@@ -23,137 +26,65 @@ import std.os
 import std.sandbox
 import std.string
 
-// The largest message either side accepts. A peer that announces more, or
-// never finishes a header, is cut off rather than buffered without end.
+// The largest message either side accepts. A peer that announces more is
+// cut off before a byte of it is buffered.
 const MAX_FRAME = 65536
-// "65536:" is the longest header: up to 5 digits, then the colon.
-const MAX_HEADER = 6
+// The longest the host waits for the guest's next message.
+const DEADLINE_MS = 5000
 
 const AUDIT_LOG = "build/audit.log"
 
-// A channel, and what has arrived on it past the last message read.
-struct Wire {
-    ch: int
-    pending: string
-}
-
-wire_new(ch: int) -> Wire {
-    return Wire { ch: ch, pending: "" }
-}
-
-// Framing: each message is its length in bytes, in decimal, a colon, and
-// the bytes ("12:ANSWER 42 x"). Length-prefixed, not by line, so a payload
-// may hold any byte (CBOR has 0x0a in it), and capped at MAX_FRAME. This is
-// the frame reader aether#3503 proposes std.ipc should have, written out
-// here until it does.
-
-// Sends one message.
-tell(w: *Wire, msg: string) -> string {
-    size = string.length(msg)
-    if size > MAX_FRAME { return "message of ${size} bytes is over MAX_FRAME" }
-    return ipc.write(w.ch, "${size}:${msg}")
-}
-
-// The next message, however its bytes arrive. ("", "end of stream") when
-// the other side has closed; an error, and nothing more buffered, when it
-// sends a bad header or a frame over MAX_FRAME. At most one frame and one
-// read's worth of bytes are ever held.
-hear(w: *Wire) -> (string, string) {
-    while true {
-        colon = string.index_of(w.pending, ":")
-        if colon >= 0 {
-            size, herr = frame_size(w.pending, colon)
-            if herr != "" { return "", herr }
-            start = colon + 1
-            if string.length(w.pending) - start >= size {
-                msg = string.substring(w.pending, start, start + size)
-                w.pending = string.substring(w.pending, start + size, string.length(w.pending))
-                return msg, ""
-            }
-        } else if string.length(w.pending) >= MAX_HEADER {
-            return "", "bad frame header (no length within ${MAX_HEADER} bytes)"
-        }
-        part, err = ipc.read(w.ch, 4096)
-        if err != "" { return "", err }
-        if string.length(part) == 0 { return "", "end of stream" }
-        w.pending = string.concat(w.pending, part)
+// Starts `prog` held to `perms`. Fails closed: where the child cannot be
+// contained (macOS, Windows; Linux without Landlock) it returns the reason
+// and starts nothing. With `uncontained` = 1, which a host sets only when
+// asked to by name (make ... UNCONTAINED=1), it runs the child with no
+// process sandbox, and says so on every run.
+start_guest(perms: sandbox.Grants, prog: string, argv: ptr, uncontained: int) -> (int, int, string) {
+    if uncontained == 1 {
+        println("[childbox] sandbox.spawn_socket_uncontained: the guest runs with NO process sandbox")
+        audit_log("SPAWN ${prog} UNCONTAINED (asked for by name)")
+        return sandbox.spawn_socket_uncontained(perms, prog, argv, null)
     }
-}
-
-// The length in a header that ends at `colon`: decimal digits only, at
-// most MAX_FRAME.
-frame_size(pending: string, colon: int) -> (int, string) {
-    if colon == 0 || colon >= MAX_HEADER { return 0, "bad frame header" }
-    size = 0
-    i = 0
-    while i < colon {
-        c = string.char_at(pending, i)
-        if c < 48 || c > 57 { return 0, "bad frame header (not a length)" }
-        size = size * 10 + (c - 48)
-        i = i + 1
+    ch, pid, err = sandbox.spawn_socket(perms, prog, argv, null)
+    if err != "" {
+        audit_log("SPAWN ${prog} refused: ${err}")
+        return ch, pid, err
     }
-    if size > MAX_FRAME { return 0, "frame of ${size} bytes is over MAX_FRAME" }
-    return size, ""
+    audit_log("SPAWN ${prog} (sandbox.spawn_socket)")
+    return ch, pid, ""
 }
 
-// Passing a descriptor is three steps, not one (see README, "Questions"):
-//   host  -> guest   GRANT <name>       a plain message
-//   guest -> host    TAKE <name>        "my next read is the descriptor"
-//   host  -> guest   <descriptor>       ipc.send_fd, payload <name>
-// A plain read that met the descriptor's bytes would drop the descriptor,
-// and ipc.recv_fd refuses a message that has none, so the guest says when
-// it is about to take one.
+// Sends one message as one frame.
+tell(ch: int, msg: string) -> string {
+    return ipc.write_frame(ch, msg)
+}
 
-// The host's half: answers GRANT, waits for TAKE, passes `fd`.
-grant_fd(w: *Wire, name: string, fd: int) -> string {
-    err = tell(w, "GRANT ${name}")
+// The next message, waiting at most `deadline_ms` for it to start and to
+// finish. ("", "timed out ...") when the guest stays silent; ("", err) for a
+// frame over MAX_FRAME, a stall part way, or end of stream. After any error
+// the stream is out of step: hang up.
+hear(ch: int, deadline_ms: int) -> (string, string) {
+    ready, werr = ipc.wait_readable(ch, deadline_ms)
+    if werr != "" { return "", werr }
+    if ready == 0 { return "", "timed out: no message within ${deadline_ms} ms" }
+    return ipc.read_frame_timeout(ch, MAX_FRAME, deadline_ms)
+}
+
+// Hands the guest an open descriptor: a GRANT frame, then the descriptor on
+// the next byte. The guest reads the frame exactly (std.ipc's read_frame
+// never reads past it), then receives the byte and the descriptor in one
+// recvmsg (ipc.recv, or Python's socket.recv_fds). No TAKE step.
+grant_fd(ch: int, name: string, fd: int) -> string {
+    err = tell(ch, "GRANT ${name}")
     if err != "" { return err }
-    take, rerr = hear(w)
-    if rerr != "" { return rerr }
-    if take != "TAKE ${name}" { return "expected 'TAKE ${name}', got '${take}'" }
-    return ipc.send_fd(w.ch, fd, name)
-}
-
-// The guest's half, for a guest written in Aether: says TAKE, then takes
-// the descriptor. Only valid with nothing unread pending.
-take_fd(w: *Wire, name: string) -> (int, string) {
-    if string.length(w.pending) != 0 { return -1, "unread bytes before a descriptor" }
-    err = tell(w, "TAKE ${name}")
-    if err != "" { return -1, err }
-    fd, payload, ferr = ipc.recv_fd(w.ch, 256)
-    if ferr != "" { return -1, ferr }
-    if payload != name {
-        io.fd_close(fd)
-        return -1, "descriptor came for '${payload}', not '${name}'"
-    }
-    return fd, ""
-}
-
-// THE STAND-IN. The API this repo proposes (aether#3503) is
-//
-//     sandbox.spawn_socket(perms, prog, argv, env) -> (fd, pid, err)
-//
-// os.run_socket's channel plus spawn_sandboxed's containment, held to
-// `perms`, in the sandbox namespace because containment is the point. It
-// fails closed: where it cannot contain the child (macOS and Windows today)
-// it refuses to start it. Running a guest uncontained is something a host
-// has to ask for by name, never what a forgotten argument does.
-//
-// Aether does not have it yet, so both hosts here ask for exactly that by
-// name: this runs the guest with plain os.run_socket, the same channel and
-// NO containment. `perms` is taken and ignored. It says so on every run,
-// and the guest's probes report what they got.
-spawn_socket_uncontained(perms: sandbox.Grants, prog: string, argv: ptr) -> (int, int, string) {
-    _ = perms
-    println("[childbox] spawn_socket_uncontained: the guest runs with NO process sandbox")
-    println("[childbox] (sandbox.spawn_socket, which would contain it, does not exist yet)")
-    return os.run_socket(prog, argv, null)
+    return ipc.send_fd(ch, fd, "F")
 }
 
 // Records one permission decision. Both kinds land here, in one file: the
-// host's answers to the guest's requests (GRANT, DENY) and what the guest
-// reports from its own sandbox (AUDIT messages). Lines that came from the
-// guest say so, and are escaped, since a guest chooses their bytes.
+// host's answers to the guest's requests (GRANT, DENY), timeouts and kills,
+// and what the guest reports from its own sandbox (AUDIT messages). Lines
+// that came from the guest say so, and are escaped, since a guest chooses
+// their bytes.
 audit_log(event: string) {
     err = io.append_file(AUDIT_LOG, "${event}\n")
     if err != "" { println("[childbox] audit log ${AUDIT_LOG}: ${err}") }
@@ -164,21 +95,21 @@ audit_log(event: string) {
 printable(s: string) -> string {
     hex = "0123456789abcdef"
     out = ""
-    run = 0
+    seg = 0
     i = 0
     n = string.length(s)
     while i < n {
         c = string.char_at(s, i)
         if c >= 0 && (c < 32 || c == 127 || c == 92) {
-            out = string.concat(out, string.substring(s, run, i))
+            out = string.concat(out, string.substring(s, seg, i))
             hi = c / 16
             lo = c % 16
             out = string.concat(out, "\\x${string.substring(hex, hi, hi + 1)}${string.substring(hex, lo, lo + 1)}")
-            run = i + 1
+            seg = i + 1
         }
         i = i + 1
     }
-    return string.concat(out, string.substring(s, run, n))
+    return string.concat(out, string.substring(s, seg, n))
 }
 
 // Prints one message of the conversation with its direction. Everything a
@@ -199,58 +130,84 @@ show(from: string, to: string, line: string) {
 //                            guest DONE
 //   host  BYE                guest BYE
 //
-// Either side starts exchanges: the host asks the guest a question, and
-// the guest asks the host for files. `policy` maps a name the guest may
-// ask for to a path on the host's disk, or "" for no.
+// respond: what the host says to one line from the guest (REQUEST aside,
+// which needs the transport). Adds the host's answers to `out`, a std.list
+// of strings, shown as they are decided; 1 when the guest has said BYE.
+respond(guest: string, line: string, out: ptr) -> int {
+    show(guest, "host", line)
+    verb, rest = split_verb(line)
+    if verb == "HELLO" {
+        show("host", guest, "ASK multiply 6 7")
+        list.add(out, "ASK multiply 6 7")
+    } else if verb == "AUDIT" {
+        audit_log("${guest} reports: ${printable(rest)}")
+    } else if verb == "DONE" {
+        show("host", guest, "BYE")
+        list.add(out, "BYE")
+    } else if verb == "BYE" {
+        return 1
+    }
+    return 0
+}
+
+// The whole conversation with a guest that speaks frames itself. Every wait
+// for the guest is bounded by DEADLINE_MS; a guest that stays silent past it,
+// or breaks the framing, ends the conversation with an error (the caller
+// hangs up and kills it). `policy` maps a name the guest may ask for to a
+// path on the host's disk, or "" for no.
 converse(ch: int, guest: string, policy: fn) -> string {
-    audit_log("--- session: ${guest}")
-    w = wire_new(ch)
     hello = "HELLO from the Aether host"
     show("host", guest, hello)
-    err = tell(&w, hello)
+    err = tell(ch, hello)
     if err != "" { return err }
+    out = list.new()
+    defer list.free(out)
     while true {
-        line, rerr = hear(&w)
-        if rerr != "" { return "guest went away: ${rerr}" }
-        show(guest, "host", line)
-        verb, rest = split_verb(line)
-        if verb == "HELLO" {
-            ask = "ASK multiply 6 7"
-            show("host", guest, ask)
-            err = tell(&w, ask)
-        } else if verb == "REQUEST" {
-            err = answer_request(&w, guest, rest, policy)
-        } else if verb == "AUDIT" {
-            audit_log("${guest} reports: ${printable(rest)}")
-        } else if verb == "DONE" {
-            show("host", guest, "BYE")
-            err = tell(&w, "BYE")
-        } else if verb == "BYE" {
-            return ""
+        line, rerr = hear(ch, DEADLINE_MS)
+        if rerr != "" {
+            audit_log("${guest} TIMEOUT or bad frame: ${rerr}")
+            return "guest went quiet or broke the framing: ${rerr}"
         }
-        if err != "" { return err }
+        verb, rest = split_verb(line)
+        if verb == "REQUEST" {
+            show(guest, "host", line)
+            err = answer_request(ch, guest, rest, policy)
+            if err != "" { return err }
+        } else {
+            list.clear(out)
+            done = respond(guest, line, out)
+            n = list.size(out)
+            i = 0
+            while i < n {
+                item, _ = list.get_string(out, i)
+                err = tell(ch, item)
+                if err != "" { return err }
+                i = i + 1
+            }
+            if done == 1 { return "" }
+        }
     }
 }
 
 // GRANT and pass the file, or DENY.
-answer_request(w: *Wire, guest: string, name: string, policy: fn) -> string {
+answer_request(ch: int, guest: string, name: string, policy: fn) -> string {
     string path = policy(name)
     if path == "" {
         deny = "DENY ${name}: not in this guest's policy"
         audit_log("${guest} DENY ${printable(name)}: not in policy")
         show("host", guest, deny)
-        return tell(w, deny)
+        return tell(ch, deny)
     }
     fd, oerr = io.fd_open_read(path)
     if oerr != "" {
         deny = "DENY ${name}: ${oerr}"
         audit_log("${guest} DENY ${printable(name)}: ${oerr}")
         show("host", guest, deny)
-        return tell(w, deny)
+        return tell(ch, deny)
     }
     audit_log("${guest} GRANT ${printable(name)} -> ${path}")
     show("host", guest, "GRANT ${name}   (then ${path} as an open descriptor)")
-    err = grant_fd(w, name, fd)
+    err = grant_fd(ch, name, fd)
     io.fd_close(fd)
     return err
 }
