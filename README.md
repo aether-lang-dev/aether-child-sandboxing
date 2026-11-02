@@ -18,9 +18,9 @@ There are three showcases with the same conversation, line for line:
 
 | Showcase | The guest | What crosses into the child |
 |---|---|---|
-| `python/` | stock `python3`, standard library only | nothing: no bridge, no `libpython` ABI to match |
-| `rexx/` | [RexxAE](https://github.com/aether-lang-dev/RexxAE), run by RexxAE's own worker process | nothing: the worker is one binary with the engine compiled in |
-| `js/` | JavaScript on [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) (the Aether port of Bellard's MicroQuickJS), run by `js-worker` | nothing: the worker is one binary with the engine compiled in |
+| [`python/`](python/README.md) | stock `python3`, standard library only | nothing: no bridge, no `libpython` ABI to match |
+| [`rexx/`](rexx/README.md) | [RexxAE](https://github.com/aether-lang-dev/RexxAE), run by RexxAE's own worker process | nothing: the worker is one binary with the engine compiled in |
+| [`js/`](js/README.md) | JavaScript on [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) (the Aether port of Bellard's MicroQuickJS), run by `js-worker` | nothing: the worker is one binary with the engine compiled in |
 
 The JavaScript one is sae's case teased out. sae, the family's page
 browser, runs pages' JavaScript, which nobody vetted, and today does it in
