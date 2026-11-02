@@ -21,6 +21,13 @@ WORKER := $(REXXAE)/build/worker/rexxae-worker
 SILENT := $(REXXAE)/build/worker/silent
 JS_WORKER := js/target/build/bin/js-worker
 MODE := $(if $(filter 1,$(UNCONTAINED)),uncontained,)
+# A sandboxed spawn finds libaether_sandbox.so under AETHER_HOME, which `ae run`
+# sets but a program run from here would not have. Default it to the
+# toolchain AE comes from (<prefix>/bin/ae, or a source tree's build/ae).
+ifeq ($(strip $(AETHER_HOME)),)
+AETHER_HOME := $(abspath $(dir $(shell command -v $(AE)))/..)
+endif
+export AETHER_HOME
 # aeb runs `ae` from PATH: the AE named here, when it is a path.
 AE_PATH := $(if $(findstring /,$(AE)),PATH=$(abspath $(dir $(AE))):$$PATH,)
 
