@@ -4,8 +4,8 @@
 > the real calls, `sandbox.spawn_socket` and `std.ipc`'s frames, which
 > arrived in 0.873.0 through
 > [aether#3510](https://github.com/aether-lang-dev/aether/pull/3510).
-> RexxAE's worker is on RexxAE's `main`; the JavaScript worker uses RexxAE's
-> host module from there, and mquickjs-ae's `main`. Discussion and
+> The Rexx worker is on [RexxAE](https://github.com/aether-lang-dev/RexxAE)'s `main`; the JavaScript worker uses RexxAE's
+> host module from there, and [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae)'s `main`. Discussion and
 > decisions: [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
 An Aether host runs a guest language **in a separate, sandboxed child
@@ -19,8 +19,8 @@ There are three showcases with the same conversation, line for line:
 | Showcase | The guest | What crosses into the child |
 |---|---|---|
 | `python/` | stock `python3`, standard library only | nothing: no bridge, no `libpython` ABI to match |
-| `rexx/` | RexxAE, run by RexxAE's own worker process | nothing: the worker is one binary with the engine compiled in |
-| `js/` | JavaScript on mquickjs-ae (the Aether port of MicroQuickJS), run by `js-worker` | nothing: the worker is one binary with the engine compiled in |
+| `rexx/` | [RexxAE](https://github.com/aether-lang-dev/RexxAE), run by RexxAE's own worker process | nothing: the worker is one binary with the engine compiled in |
+| `js/` | JavaScript on [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) (the Aether port of Bellard's MicroQuickJS), run by `js-worker` | nothing: the worker is one binary with the engine compiled in |
 
 The JavaScript one is sae's case teased out. sae, the family's page
 browser, runs pages' JavaScript, which nobody vetted, and today does it in
@@ -108,9 +108,9 @@ Python 3.14) with the aether branch above:**
 
 ## Run it
 
-You need Aether 0.873.0 or later (`ae upgrade`), a RexxAE checkout next to
+You need Aether 0.873.0 or later (`ae upgrade`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
 this one (`../RexxAE`) and `python3` (3.9 or newer). For `make js`, also an
-mquickjs-ae checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
+[mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
 points at) and `aeb` (v0.333 or later), which builds `js-worker` as it
 builds mquickjs-ae, with the engine compiled by the same Aether tree.
 
