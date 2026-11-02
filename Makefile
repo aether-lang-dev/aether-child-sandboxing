@@ -1,6 +1,7 @@
-# Needs an Aether with sandbox.spawn_socket and std.ipc's frames (README,
-# "Status"). Point AE and AETHER_HOME at one: RexxAE's worker and the
-# programs here are built by the same ae.
+# Needs Aether 0.873.0 or later (sandbox.spawn_socket, std.ipc frames).
+# AE defaults to the ae on PATH, AETHER_HOME to your environment's (an installed
+# release sets it); set both to build with another Aether tree.
+# RexxAE's worker and the programs here are built by the same ae.
 #
 #   make python              the Python showcase, then a guest that goes quiet
 #   make rexx                the RexxAE showcase, then a script stuck in HEAR

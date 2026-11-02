@@ -1,13 +1,12 @@
 # aether-child-sandboxing
 
-> **Status: needs an Aether release that does not exist yet.** This
-> branch runs on the real calls, `sandbox.spawn_socket` and `std.ipc`'s
-> frames, which are on the aether branch `feat/child-sandboxing` (over
-> 0.872.0) and in no release. `main` stays on 0.871.0, with the stand-in,
-> until a release contains them. RexxAE's worker is on its local branch
-> `feat/generic-worker`; the JavaScript worker uses RexxAE's host module
-> from there, and mquickjs-ae's `main`. Discussion and decisions:
-> [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
+> **Status: runs on Aether 0.873.0 or later.** All three guests run on
+> the real calls, `sandbox.spawn_socket` and `std.ipc`'s frames, which
+> arrived in 0.873.0 through
+> [aether#3510](https://github.com/aether-lang-dev/aether/pull/3510).
+> RexxAE's worker is on RexxAE's `main`; the JavaScript worker uses RexxAE's
+> host module from there, and mquickjs-ae's `main`. Discussion and
+> decisions: [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
 An Aether host runs a guest language **in a separate, sandboxed child
 process** and talks to it both ways over `std.ipc`. The guest gets one
@@ -95,36 +94,35 @@ Python 3.14) with the aether branch above:**
 
 **Left to do:**
 
-1. **A release.** An Aether release containing `sandbox.spawn_socket`,
-   `grant_runtime`, the kernel layer and `std.ipc`'s frames, `recv` and
-   deadlines; then RexxAE's worker on its `main`, and this branch on `main`.
-2. **macOS and Windows** containment. Until then `spawn_socket` refuses
+1. **macOS and Windows** containment. Until then `spawn_socket` refuses
    there, and only the uncontained run, by name, works.
-3. **Python has no cancel.** Its host can only kill a quiet guest; a
+2. **Python has no cancel.** Its host can only kill a quiet guest; a
    Python guest would need its own `CANCEL` handling to stop politely.
-4. **The host module's home.** `rexxworker` drives two engines now and
+3. **The host module's home.** `rexxworker` drives two engines now and
    nothing in it is about Rexx; it wants a neutral name and a place both
    can take it from (std, or this repo's `lib/`), rather than the JS
    showcase reaching into RexxAE.
-5. **sae itself** runs pages in its own process. Moving them into a
+4. **sae itself** runs pages in its own process. Moving them into a
    worker like `js-worker` would be on quickjs-ng (`contrib.quickjs`,
    whose time limit is the same hook), not on mquickjs-ae.
 
 ## Run it
 
-You need an Aether toolchain built from the aether branch
-`feat/child-sandboxing`, a RexxAE checkout next to this one (`../RexxAE`, on
-`feat/generic-worker`) and `python3` (3.9 or newer). For `make js`, also an
+You need Aether 0.873.0 or later (`ae upgrade`), a RexxAE checkout next to
+this one (`../RexxAE`) and `python3` (3.9 or newer). For `make js`, also an
 mquickjs-ae checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
 points at) and `aeb` (v0.333 or later), which builds `js-worker` as it
 builds mquickjs-ae, with the engine compiled by the same Aether tree.
 
 ```sh
-make python AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
-make rexx   AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
-make js     AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
-make js-test AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
+make python
+make rexx
+make js
+make js-test
 ```
+
+To use an Aether tree other than the one on `PATH`, pass both
+`AE=/path/to/aether/build/ae` and `AETHER_HOME=/path/to/aether`.
 
 `make python` runs the conversation, then a guest that goes quiet (killed
 at the deadline, 5 s). `make rexx` builds RexxAE's worker, runs the
@@ -444,8 +442,8 @@ short:
   so is `try`, so the natural names for protocol code fail to compile.
   Here they are `tell`, `hear`, `answer` and `start_guest`.
 - The preload's `dlopen` check refused only the bare names `libc.so.6` and
-  `libc.so`; libc by its path loaded. Fixed on aether's
-  `feat/child-sandboxing`: libc and the loader are matched by basename, by
+  `libc.so`; libc by its path loaded. Fixed in 0.873.0
+  (aether#3510): libc and the loader are matched by basename, by
   where a path leads, and by the handle the loader returns. The preload
   alone is still not a wall against an FFI (the raw-syscall row), which
   is what Landlock is for.
