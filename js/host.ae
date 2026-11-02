@@ -1,0 +1,153 @@
+// The JavaScript showcase's host: runs js/chat.js on MicroQuickJS
+// (mquickjs-ae) in js-worker (js/worker.ae, built by js/.build.ae) under
+// sandbox.spawn_socket, and talks to it over std.ipc. The same
+// conversation as python/host.ae and rexx/host.ae, line for line.
+//
+// js-worker speaks RexxAE's worker protocol, so this host drives it with
+// RexxAE's host module, rexxworker: nothing in that module is about Rexx.
+// The worker locks itself down with sandbox.enforce and no grants before
+// the first JavaScript runs, and answers CANCEL from inside the engine
+// (MicroQuickJS's interrupt hook). This host mounts three functions:
+//   hostHear()           the host's next message
+//   hostTell(line)       a message to the host
+//   hostRequest(name)    ask for a file: {granted:true, text:...}, or no
+//
+// Run (from the repo root): make js
+//   args: <worker program> [stuck | deaf | big] [uncontained]
+//   stuck        js/stuck.js: while (true) {}, cancelled at the deadline
+//   deaf         the program is a stand-in that never answers: killed
+//   big          js/big.js: a frame over 64 KiB, refused
+//   uncontained  rexxworker.launch_uncontained, by name (make UNCONTAINED=1)
+
+import std.fs
+import std.json
+import std.list
+import std.os
+import std.sandbox
+import std.string
+import childbox
+import rexxworker
+
+main() {
+    if os.args_count() < 2 {
+        println("usage: host <js-worker> [stuck | deaf | big] [uncontained]")
+        exit(2)
+    }
+    prog = os.args_get(1)
+    mode = ""
+    uncontained = 0
+    i = 2
+    while i < os.args_count() {
+        a = os.args_get(i)
+        if a == "uncontained" { uncontained = 1 } else { mode = a }
+        i = i + 1
+    }
+    script = "js/chat.js"
+    session = "js"
+    if mode == "stuck" {
+        script = "js/stuck.js"
+        session = "js-stuck"
+    } else if mode == "deaf" {
+        session = "js-deaf"
+    } else if mode == "big" {
+        script = "js/big.js"
+        session = "js-big"
+    }
+    source, serr = fs.read(script)
+    if serr != "" {
+        println("cannot read ${script}: ${serr}")
+        exit(1)
+    }
+
+    // What the worker may do on its own: nothing. It is one binary with the
+    // engine compiled in, and its script comes over the socket.
+    guest = sandbox.new("js-guest") {
+    }
+    defer sandbox.free(guest)
+
+    // What the guest may ASK for: one logical name, mapped to a file here.
+    policy = |name: string| {
+        if name == "config" { return "data/config.txt" }
+        return ""
+    }
+
+    childbox.audit_log("--- session: ${session}")
+    w, err = start_worker(guest, prog, session, uncontained)
+    if err != "" {
+        println("spawn refused: ${err}")
+        exit(1)
+    }
+    if uncontained == 1 {
+        println("[js host] rexxworker.launch_uncontained: the worker runs with NO process sandbox")
+    }
+    rexxworker.mount(&w, "hostHear", 0, 0)
+    rexxworker.mount(&w, "hostTell", 1, 1)
+    rexxworker.mount(&w, "hostRequest", 1, 1)
+    if mode == "" { rexxworker.probe(&w) }
+    rexxworker.start(&w, source)
+
+    println("conversation (permission decisions also go to ${childbox.AUDIT_LOG}):")
+    // What the host has to say, waiting for the guest's next hostHear.
+    outbox = list.new()
+    defer list.free(outbox)
+    hello = "HELLO from the Aether host"
+    childbox.show("host", session, hello)
+    list.add(outbox, hello)
+    while true {
+        e = rexxworker.next(&w)
+        if e.kind == "CALL" {
+            arg = first_arg(e.text)
+            if e.name == "hostHear" {
+                if list.size(outbox) > 0 {
+                    line, _ = list.get_string(outbox, 0)
+                    list.remove(outbox, 0)
+                    rexxworker.answer(&w, rexxworker.json_string(line))
+                }
+                // Nothing to say: no answer. The deadline decides.
+            } else if e.name == "hostTell" {
+                childbox.respond(session, arg, outbox)
+                rexxworker.answer(&w, "true")
+            } else if e.name == "hostRequest" {
+                childbox.show(session, "host", "REQUEST ${arg}")
+                string path = policy(arg)
+                if path == "" {
+                    childbox.show("host", session, "DENY ${arg}: not in this guest's policy")
+                    rexxworker.deny(&w, arg, "not in this guest's policy")
+                } else {
+                    childbox.show("host", session, "GRANT ${arg}   (then ${path} as an open descriptor)")
+                    rexxworker.grant_file(&w, arg, path)
+                }
+            }
+        } else if e.kind == "SAY" {
+            childbox.show(session, "host", "SAY ${e.text}")
+        } else if e.kind == "DONE" {
+            println("  worker: done, exit ${e.code}")
+            break
+        } else {
+            println("  worker: ${e.kind} ${childbox.printable(e.text)}")
+            break
+        }
+    }
+}
+
+// The worker in sandbox.spawn_socket, or, asked for by name, without it.
+start_worker(guest: sandbox.Grants, prog: string, session: string, uncontained: int) -> (rexxworker.Worker, string) {
+    if uncontained == 1 {
+        return rexxworker.launch_uncontained(guest, prog, session, childbox.AUDIT_LOG)
+    }
+    return rexxworker.launch(guest, prog, session, childbox.AUDIT_LOG)
+}
+
+// The one argument in a JSON array of arguments, as text.
+first_arg(args: string) -> string {
+    v, perr = json.parse(args)
+    if perr != "" { return "" }
+    el, aerr = json.array_get(v, 0)
+    text = ""
+    if aerr == "" {
+        s, gerr = json.get_string(el)
+        if gerr == "" { text = s }
+    }
+    json.json_free(v)
+    return text
+}

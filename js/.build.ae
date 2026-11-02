@@ -1,0 +1,52 @@
+// The JS worker binary: mquickjs-ae's engine (its own source list,
+// gen/mqjssources) linked with worker.ae and rom.c, against the ROM that
+// rom/.build.ae generates. mquickjs-ae is reached through the js/mqjs
+// symlink (with js/ae and js/gen beside it, since the engine's Aether
+// imports and that source list resolve from here); it is used as a library
+// and nothing in it changes.
+//
+// Built by `make js` (aeb, run in js/), with the engine against the same
+// Aether tree as everything else: JS_AETHER_HOME.
+
+import bldr
+import bldr (dep)
+import c
+import c (sources, aether_source, cflag, link_flag, output_file, aether_home, aether_caps)
+import gen.mqjssources
+import std.os
+import std.string
+
+aether_root_() -> string {
+    root = os.getenv("JS_AETHER_HOME")
+    if root != null && string.length(root) > 0 { return root }
+    home = os.getenv("AETHER_HOME")
+    if home != null { return home }
+    return ""
+}
+
+aeb(cap) {
+    bldr.build() {
+        dep("rom/.build.ae")
+        c.program() {
+            cflag("-Os")
+            cflag("-D_GNU_SOURCE")
+            cflag("-fno-math-errno")
+            cflag("-fno-trapping-math")
+            cflag("-Imqjs")
+            aether_home(aether_root_())
+            // The worker uses the socket, the clock and its own probes (fs,
+            // net); the engine and the worker declare C externs.
+            aether_caps("fs,os,net,extern")
+
+            mqjssources.register_engine_c_sources("mqjs")
+            mqjssources.register_engine_sources("ae")
+
+            aether_source("worker.ae")
+            sources("rom.c")
+
+            link_flag("-lm")
+            output_file("js-worker")
+        }
+        return 0
+    }
+}

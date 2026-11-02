@@ -5,7 +5,8 @@
 > frames, which are on the aether branch `feat/child-sandboxing` (over
 > 0.872.0) and in no release. `main` stays on 0.871.0, with the stand-in,
 > until a release contains them. RexxAE's worker is on its local branch
-> `feat/generic-worker`. Discussion and decisions:
+> `feat/generic-worker`; the JavaScript worker uses RexxAE's host module
+> from there, and mquickjs-ae's `main`. Discussion and decisions:
 > [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
 An Aether host runs a guest language **in a separate, sandboxed child
@@ -14,12 +15,22 @@ socket and nothing else, and asks the host for what it needs. A file comes
 back as an **open descriptor**, not a path, so the guest never needs the
 right to open anything.
 
-There are two showcases with the same conversation, line for line:
+There are three showcases with the same conversation, line for line:
 
 | Showcase | The guest | What crosses into the child |
 |---|---|---|
 | `python/` | stock `python3`, standard library only | nothing: no bridge, no `libpython` ABI to match |
 | `rexx/` | RexxAE, run by RexxAE's own worker process | nothing: the worker is one binary with the engine compiled in |
+| `js/` | JavaScript on mquickjs-ae (the Aether port of MicroQuickJS), run by `js-worker` | nothing: the worker is one binary with the engine compiled in |
+
+The JavaScript one is sae's case teased out. sae, the family's page
+browser, runs pages' JavaScript, which nobody vetted, and today does it in
+its own process on `contrib.quickjs` (quickjs-ng) with a time limit on each
+entry into the page (sae began on mquickjs-ae and moved for modern
+JavaScript). `js/` is the out-of-process shape for it: untrusted JavaScript
+in a child that locks itself down before the first line runs, reaches the
+host only through functions the host mounted, and is cancelled from inside
+the engine when a deadline passes.
 
 Both hosts start their guest with `sandbox.spawn_socket`, which fails
 closed: on macOS and Windows, or on Linux without Landlock, it starts
@@ -55,6 +66,28 @@ Python 3.14) with the aether branch above:**
 - RexxAE's generic worker (`../RexxAE/worker`): any script, any mounted
   functions, locking itself down with `sandbox.enforce` and no grants
   before its first step. `rexx/guest.ae` is gone.
+- `js-worker` (`js/worker.ae`): mquickjs-ae's engine compiled in, speaking
+  RexxAE's worker protocol unchanged, so `js/host.ae` drives it with
+  RexxAE's host module, `rexxworker`. It locks itself down the same way,
+  before the first JavaScript runs, and is spawned with no grants.
+  - **Its standard library is baked at build time**, as MicroQuickJS does
+    it: `js/rom` runs mquickjs-ae's ROM generator (its `gen/genengine`,
+    used as a library) on the core-only spec, the language plus
+    `console.log`, `print` and `performance.now`, with one global added,
+    `__host_call`. A host's mounts are JavaScript wrappers round it that
+    check their arity and pass their arguments as JSON; it refuses a name
+    the host did not mount.
+  - **Cancel is in the engine.** MicroQuickJS runs a script to the end in
+    one `JS_Eval`, so there are no slices to step; instead it calls an
+    interrupt handler every 10000 calls and backward jumps
+    (`JS_SetInterruptHandler`), and the worker's looks for a `CANCEL` on
+    the socket without waiting. On one it returns 1 and the engine throws
+    an error no `catch` can take. A script waiting on the host gets the
+    `CANCEL` as its reply. `make js` runs a `while (true)` that catches
+    everything, cancelled at the deadline.
+  - `make js-test` (`js/test_worker.ae`) holds all of this, contained on
+    Linux. With the interrupt handler not installed, its busy-loop case
+    fails as it should: `KILLED no answer to CANCEL` instead of the cancel.
 - The host's policy (grant or refuse each request by name), and **one
   audit log** (`build/audit.log`) for spawns, GRANTs, DENYs, timeouts,
   cancels, kills and what the Rexx worker's own sandbox refused.
@@ -69,22 +102,37 @@ Python 3.14) with the aether branch above:**
    there, and only the uncontained run, by name, works.
 3. **Python has no cancel.** Its host can only kill a quiet guest; a
    Python guest would need its own `CANCEL` handling to stop politely.
+4. **The host module's home.** `rexxworker` drives two engines now and
+   nothing in it is about Rexx; it wants a neutral name and a place both
+   can take it from (std, or this repo's `lib/`), rather than the JS
+   showcase reaching into RexxAE.
+5. **sae itself** runs pages in its own process. Moving them into a
+   worker like `js-worker` would be on quickjs-ng (`contrib.quickjs`,
+   whose time limit is the same hook), not on mquickjs-ae.
 
 ## Run it
 
 You need an Aether toolchain built from the aether branch
 `feat/child-sandboxing`, a RexxAE checkout next to this one (`../RexxAE`, on
-`feat/generic-worker`) and `python3` (3.9 or newer).
+`feat/generic-worker`) and `python3` (3.9 or newer). For `make js`, also an
+mquickjs-ae checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
+points at) and `aeb` (v0.333 or later), which builds `js-worker` as it
+builds mquickjs-ae, with the engine compiled by the same Aether tree.
 
 ```sh
 make python AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
 make rexx   AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
+make js     AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
+make js-test AE=/path/to/aether/build/ae AETHER_HOME=/path/to/aether
 ```
 
 `make python` runs the conversation, then a guest that goes quiet (killed
 at the deadline, 5 s). `make rexx` builds RexxAE's worker, runs the
 conversation, then a script stuck in `HOST_HEAR` (cancelled at the
-deadline). On macOS both refuse to start a guest:
+deadline). `make js` builds `js-worker`, runs the conversation, then a
+script in `while (true)` (cancelled at the deadline), a worker that never
+answers (killed after the `CANCEL`'s grace) and a frame over 64 KiB
+(refused). On macOS all of them refuse to start a guest:
 
 ```
 spawn refused: sandbox.spawn_socket: cannot contain a child on macOS, so nothing was started (sandbox.spawn_socket_uncontained runs one with no sandbox)
@@ -95,6 +143,11 @@ sandbox, saying so on every run.
 
 Tested contained on CachyOS (x86_64, Linux 7.3, Python 3.14), and
 uncontained on macOS (arm64, Python 3.9).
+
+`js/mqjs` is a relative symlink to `../../mquickjs-ae`, with `js/ae` and
+`js/gen` beside it (the engine's own imports and its source list resolve
+from `js/`, where aeb runs); re-point `js/mqjs` to build against another
+checkout. Nothing in mquickjs-ae changes.
 
 ## The conversation
 
@@ -137,8 +190,43 @@ conversation ended: guest went quiet or broke the framing: timed out: no message
   worker: ERROR cancelled by host: deadline of 5000 ms passed
 ```
 
-And `build/audit.log` after both, the host's decisions and the Rexx
-worker's reports together:
+The JavaScript transcript, contained on CachyOS:
+
+```
+  host -> js  HELLO from the Aether host
+  js -> host  HELLO from MicroQuickJS (mquickjs-ae)
+  host -> js  ASK multiply 6 7
+  js -> host  ANSWER 42
+  js -> host  REQUEST config
+  host -> js  GRANT config   (then data/config.txt as an open descriptor)
+  js -> host  SAY config says: greeting=hello from a file on the host's disk
+  js -> host  REQUEST /etc/passwd
+  host -> js  DENY /etc/passwd: not in this guest's policy
+  js -> host  SAY the host said no: not in this guest's policy
+  js -> host  PROBE load('/etc/passwd'): refused (ReferenceError: variable 'load' is not defined)
+  js -> host  PROBE require('fs'): refused (ReferenceError: variable 'require' is not defined)
+  js -> host  PROBE std.loadFile / os.open (QuickJS's modules): refused (ReferenceError: variable 'std' is not defined)
+  js -> host  PROBE new XMLHttpRequest(): refused (ReferenceError: variable 'XMLHttpRequest' is not defined)
+  js -> host  PROBE fetch('https://1.1.1.1/'): refused (ReferenceError: variable 'fetch' is not defined)
+  js -> host  PROBE __host_call('readFile', ...) past the mounts: refused (Error: readFile is not a function the host mounted)
+  js -> host  DONE
+  host -> js  BYE
+  js -> host  BYE
+  worker: done, exit 0
+  ...
+  host -> js-stuck  HELLO from the Aether host
+  js-stuck -> host  SAY spinning in while (true), catching everything
+  worker: ERROR cancelled by host: deadline of 5000 ms passed
+  ...
+  host -> js-deaf  HELLO from the Aether host
+  worker: KILLED no answer to CANCEL within 1000 ms
+  ...
+  host -> js-big  HELLO from the Aether host
+  worker: KILLED frame refused: ipc.read_frame: frame longer than max
+```
+
+And `build/audit.log` after the Python and Rexx runs, the host's decisions
+and the Rexx worker's reports together:
 
 ```
 --- session: python
@@ -165,6 +253,41 @@ rexx-stuck reports: rexxae-worker locked itself down before the first step: no g
 rexx-stuck TIMEOUT no frame within 5000 ms; CANCEL sent
 rexx-stuck ERROR cancelled by host: deadline of 5000 ms passed
 ```
+
+and after the JavaScript runs:
+
+```
+--- session: js
+js SPAWN js/target/build/bin/js-worker (sandbox.spawn_socket)
+js reports: js-worker locked itself down before the first step: no grants
+js reports: probe worker fs.read('/etc/passwd'): refused (/etc/passwd: Permission denied)
+js reports: probe worker tcp.connect 1.1.1.1:443: refused (connect failed)
+js reports: probe worker raw syscall instruction openat('/etc/passwd'), round std: refused (Permission denied)
+js reports: js-worker sandbox refused fs_read /etc/passwd
+js reports: js-worker sandbox refused tcp 1.1.1.1:443
+js GRANT config -> data/config.txt
+js DENY /etc/passwd: not in this guest's policy
+--- session: js-stuck
+js-stuck SPAWN js/target/build/bin/js-worker (sandbox.spawn_socket)
+js-stuck reports: js-worker locked itself down before the first step: no grants
+js-stuck TIMEOUT no frame within 5000 ms; CANCEL sent
+js-stuck ERROR cancelled by host: deadline of 5000 ms passed
+--- session: js-deaf
+js-deaf SPAWN ../RexxAE/build/worker/silent (sandbox.spawn_socket)
+js-deaf TIMEOUT no frame within 5000 ms; CANCEL sent
+js-deaf KILLED no answer to CANCEL within 1000 ms
+--- session: js-big
+js-big SPAWN js/target/build/bin/js-worker (sandbox.spawn_socket)
+js-big reports: js-worker locked itself down before the first step: no grants
+js-big KILLED frame refused: ipc.read_frame: frame longer than max
+```
+
+The worker that never answers is RexxAE's stand-in (`tests/worker_silent`),
+which reads every frame and replies to none. `js-worker` itself cannot be
+made to ignore a `CANCEL` from JavaScript: the interrupt handler is the
+engine's, and its error cannot be caught. What the kill is for is a worker
+that has stopped answering for another reason, a bug or a hang in native
+code.
 
 ## What a developer writes
 
@@ -203,6 +326,18 @@ rexxworker.start(&w, source)
 e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILLED
 ```
 
+**The JavaScript host** (`js/host.ae`) is the Rexx host with other
+names. `js-worker` speaks RexxAE's worker protocol, so the same module
+drives it:
+
+```aether
+guest = sandbox.new("js-guest") {}               // the worker needs nothing
+w, err = rexxworker.launch(guest, "js/target/build/bin/js-worker", "js", childbox.AUDIT_LOG)
+rexxworker.mount(&w, "hostHear", 0, 0)           // and hostTell, hostRequest
+rexxworker.start(&w, source)
+e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILLED
+```
+
 **The guests**, in their own languages:
 
 - **Python** (`python/guest.py`): plain `socket` on the descriptor named in
@@ -214,6 +349,10 @@ e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILL
   socket. No `ADDRESS` environment is mounted. The worker runs the script
   inside its own `sandbox.enforce` with no grants (RexxAE README, "Worker
   process").
+- **JavaScript** (`js/chat.js`): the same, with `hostHear()`,
+  `hostTell(line)` and `hostRequest(name)`. `hostRequest` returns an
+  object, `{granted: true, text: ...}` or `{granted: false, why: ...}`.
+  `print` and `console.log` are `SAY` lines.
 
 **The shared part** (`lib/childbox`): the spawn, the frames with their
 deadline, the descriptor hand-over, the host's half of the conversation, the
@@ -244,6 +383,14 @@ would allow, from its code:
 | Rexx `ADDRESS SYSTEM` | RC 1 | RC 1 | RC 1 (the engine's own wall) |
 | Rexx worker `fs.read` / `tcp.connect` | refused | refused | refused (the worker's own enforce) |
 | Rexx script waiting in `HOST_HEAR` | `cancelled by host` at the deadline | `cancelled by host` | `cancelled by host` at the deadline (5 s) |
+| JS `load`, `require`, `std`/`os`, `XMLHttpRequest`, `fetch` | ReferenceError | ReferenceError | ReferenceError (the engine's own wall: not in its ROM) |
+| JS FFI, native modules, bytecode loading | none in MicroQuickJS | none | none: there is nothing to probe |
+| JS `__host_call` with a name the host did not mount | refused | refused | refused (the worker) |
+| JS worker `fs.read` / `tcp.connect` | refused | refused | refused (the worker's own enforce) |
+| JS worker open round std: on Linux the raw `openat` instruction, round libc and the preload; on macOS libc's `open` | **ALLOWED** (`enforce` alone is std's) | **ALLOWED** | refused (Permission denied: Landlock) |
+| JS `while (true)` catching every exception | `cancelled by host` at the deadline | `cancelled by host` | `cancelled by host` at the deadline (5 s) |
+| JS worker that never answers (the stand-in) | killed after the `CANCEL`'s grace | killed | killed (1 s after the `CANCEL`) |
+| JS `print` of 70000 bytes | frame refused, worker killed | refused | frame refused, worker killed |
 
 The raw-syscall row is the reason for a kernel layer. LD_PRELOAD only sees
 calls that go through libc, and any interpreter with an FFI (Python's
@@ -318,3 +465,17 @@ short:
   "Run it".
 - The guest-supplied request name was printed unescaped (Adil's catch);
   everything from a guest now goes through `childbox.printable`.
+- The preload replaces libc's `syscall()` and refuses it outright when
+  sandboxed, so a raw-syscall probe written in C has to use the
+  instruction itself (`js/rom.c`), as the Python one finds `syscall` in
+  libc's symbol table. Uncontained on Linux that probe opens
+  `/etc/passwd`: the worker's own `enforce` is std's checks, not a kernel
+  wall.
+- MicroQuickJS names its host functions as C symbols in a ROM generated at
+  build time, so a worker cannot add a global from C at run time. One
+  fixed native function and JavaScript wrappers for each mount do it
+  instead, and keep the protocol's `MOUNT` working unchanged.
+- MicroQuickJS refuses two `catch (e)` with the same name at the top level
+  of one script ("catch variable already exists"). Upstream does the same
+  (Bellard's `7ea5399`), so the port is faithful; a test script uses two
+  names.

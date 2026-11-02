@@ -1,0 +1,30 @@
+// The JS worker's generated headers: builds mquickjs-ae's ROM generator
+// with this worker's spec (spec_main.c) and runs it, emitting the atom
+// table and the stdlib ROM. Published as c_header_dirs for ../.build.ae.
+// Paths reach mquickjs-ae through the js/mqjs symlink.
+
+import bldr
+import c
+import c (sources, include, cflag, emit, aether_source, aether_caps)
+
+aeb(cap) {
+    bldr.build() {
+        c.generated_header() {
+            cflag("-D_GNU_SOURCE")
+            cflag("-fno-math-errno")
+            cflag("-fno-trapping-math")
+            include("../mqjs")
+            sources("spec_main.c")
+            sources("../mqjs/mquickjs_build.c")
+            // The generator declares C externs (strcmp, ...): --emit=lib
+            // refuses those without the extern grant.
+            aether_caps("extern")
+            aether_source("../mqjs/gen/buildtool/bt_predicates.ae")
+            aether_source("../mqjs/gen/buildtool/bt_atomlist.ae")
+            aether_source("../mqjs/gen/genengine/module.ae")
+            emit("-a", "mquickjs_atom.h")
+            emit("", "jsworker_stdlib.h")
+        }
+        return 0
+    }
+}
