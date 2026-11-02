@@ -75,8 +75,15 @@ def probe_raw_syscall(path):
     only a kernel layer (Landlock, seccomp) can refuse this one."""
     if not sys.platform.startswith("linux"):
         return "skipped (Linux only)"
-    libc = ctypes.CDLL(None, use_errno=True)
-    SYS_openat, AT_FDCWD = 257, -100  # x86_64 numbers
+    # openat's number differs by CPU. Only these two are known here.
+    SYS_openat = {"x86_64": 257, "aarch64": 56}.get(os.uname().machine)
+    if SYS_openat is None:
+        return f"skipped (no openat number for {os.uname().machine})"
+    AT_FDCWD = -100
+    # libc opened by name, not CDLL(None): the global lookup would find the
+    # sandbox preload's own syscall() first, and that refuses. This is the
+    # call a guest uses to go round the preload entirely.
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
     fd = libc.syscall(SYS_openat, AT_FDCWD, path.encode(), os.O_RDONLY)
     if fd >= 0:
         os.close(fd)
