@@ -114,6 +114,7 @@ the guest tries to help itself. As observed on CachyOS, contained:
   host -> python  DENY /etc/passwd: not in this guest's policy
   python -> host  SAY the host said no: /etc/passwd: not in this guest's policy
   python -> host  PROBE open('/etc/passwd'): refused (Permission denied)
+  python -> host  PROBE dlopen libc by path: refused (/usr/lib/libc.so.6)
   python -> host  PROBE raw syscall openat('/etc/passwd'): refused (Permission denied)
   python -> host  PROBE connect 1.1.1.1:443: refused (Operation not permitted)
   python -> host  DONE
@@ -236,7 +237,8 @@ would allow, from its code:
 | Probe | Uncontained (macOS) | Preload only | Contained (Linux, observed) |
 |---|---|---|---|
 | Python `open('/etc/passwd')` | ALLOWED | refused | refused (Permission denied) |
-| Python raw `syscall(openat)` via ctypes, libc loaded by path | skipped (Linux only) | **ALLOWED** | refused (Permission denied: Landlock) |
+| Python `ctypes.CDLL` of libc by its absolute path | skipped (Linux only) | refused | refused (the preload) |
+| Python raw `syscall(openat)` via ctypes, libc's `syscall` found in its symbol table in memory | skipped (Linux only) | **ALLOWED** | refused (Permission denied: Landlock) |
 | Python `connect` 1.1.1.1:443 | ALLOWED | refused | refused (Operation not permitted: seccomp) |
 | Python guest silent after HELLO | killed at the deadline | killed | killed at the deadline (5 s) |
 | Rexx `ADDRESS SYSTEM` | RC 1 | RC 1 | RC 1 (the engine's own wall) |
@@ -245,9 +247,10 @@ would allow, from its code:
 
 The raw-syscall row is the reason for a kernel layer. LD_PRELOAD only sees
 calls that go through libc, and any interpreter with an FFI (Python's
-`ctypes`, LuaJIT's FFI, Ruby's `fiddle`) can go round it: the preload
-refuses `dlopen("libc.so.6")` by that name, and the probe loads libc by its
-path instead. Landlock and the seccomp filter cannot be gone round this
+`ctypes`, LuaJIT's FFI, Ruby's `fiddle`) can go round it. The preload
+refuses a handle on libc however it is named (by name, by path, through a
+symlink), so the probe reads libc's dynamic symbol table in memory, finds
+`syscall` there, and calls it at that address. Landlock and the seccomp filter cannot be gone round this
 way, and neither needs root or user namespaces.
 
 ## Decisions
@@ -293,10 +296,12 @@ short:
 - `send`, `reply`, `spawn` and `message` are reserved words (actors), and
   so is `try`, so the natural names for protocol code fail to compile.
   Here they are `tell`, `hear`, `answer` and `start_guest`.
-- The preload's `dlopen` check refuses only the bare names `libc.so.6` and
-  `libc.so`; libc by its path loads. Under the kernel layer that gains a
-  guest nothing (the raw `openat` is still refused), but the preload alone
-  is not a wall against an FFI.
+- The preload's `dlopen` check refused only the bare names `libc.so.6` and
+  `libc.so`; libc by its path loaded. Fixed on aether's
+  `feat/child-sandboxing`: libc and the loader are matched by basename, by
+  where a path leads, and by the handle the loader returns. The preload
+  alone is still not a wall against an FFI (the raw-syscall row), which
+  is what Landlock is for.
 - `ae build --lib X` replaces the default `lib/` search path, so a program
   that uses a compiled library *and* a local module needs `--lib lib --lib X`
   ([aether#3504](https://github.com/aether-lang-dev/aether/issues/3504)).
