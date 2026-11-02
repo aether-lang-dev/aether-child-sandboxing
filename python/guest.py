@@ -14,20 +14,35 @@ import sys
 ch = socket.socket(fileno=int(os.environ["AETHER_IPC_FD"]))
 pending = b""
 
+# Framing, the same as lib/childbox: the length in bytes in decimal, a
+# colon, then the bytes. At most MAX_FRAME bytes a message.
+MAX_FRAME = 65536
+MAX_HEADER = 6
 
-def send(line):
-    ch.sendall(line.encode() + b"\n")
+
+def send(msg):
+    data = msg.encode()
+    assert len(data) <= MAX_FRAME, "message over MAX_FRAME"
+    ch.sendall(str(len(data)).encode() + b":" + data)
 
 
 def recv():
     global pending
-    while b"\n" not in pending:
+    while True:
+        head, colon, rest = pending.partition(b":")
+        if colon:
+            if not head.isdigit() or len(head) >= MAX_HEADER or int(head) > MAX_FRAME:
+                sys.exit("bad frame from the host")
+            size = int(head)
+            if len(rest) >= size:
+                pending = rest[size:]
+                return rest[:size].decode()
+        elif len(pending) >= MAX_HEADER:
+            sys.exit("bad frame from the host")
         part = ch.recv(4096)
         if not part:
             sys.exit("host went away")
         pending += part
-    line, pending = pending.split(b"\n", 1)
-    return line.decode()
 
 
 def request(name):

@@ -6,6 +6,7 @@
 //
 // Run (from the repo root): make rexx
 
+import std.io
 import std.list
 import std.os
 import std.sandbox
@@ -14,7 +15,8 @@ import childbox
 main() {
     // What the guest may do on its own: read its script. Nothing else:
     // no files of ours, no network, no processes.
-    // NOT ENFORCED YET: the stand-in spawn takes these grants and ignores them.
+    // NOT ENFORCED YET: sandbox.spawn_socket would hold the child to these;
+    // the uncontained stand-in below takes them and ignores them.
     guest = sandbox.new("rexx-guest") {
         grant_fs_read("rexx/chat.rexx")
     }
@@ -27,15 +29,21 @@ main() {
     }
 
     argv = list.new()
-    ch, pid, err = childbox.spawn_guest(guest, "build/rexx-guest", argv)
+    ch, pid, err = childbox.spawn_socket_uncontained(guest, "build/rexx-guest", argv)
     list.free(argv)
     if err != "" {
         println("spawn failed: ${err}")
         exit(1)
     }
 
-    println("conversation:")
+    println("conversation (permission decisions also go to ${childbox.AUDIT_LOG}):")
     cerr = childbox.converse(ch, "rexx", policy)
-    if cerr != "" { println("conversation failed: ${cerr}") }
+    if cerr != "" {
+        // A guest that broke the protocol may still be writing: hang up and
+        // stop it, rather than wait on a child blocked on a full socket.
+        println("conversation failed: ${cerr}")
+        io.fd_close(ch)
+        os.kill(pid, 9)
+    }
     os.wait_pid(pid)
 }

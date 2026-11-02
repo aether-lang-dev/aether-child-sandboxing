@@ -6,14 +6,18 @@
 // host of the engine answers. In-process, that host is an application.
 // Here it is this small worker, and it answers each event with a message
 // on the socket, so the application deciding is the parent, in another
-// process. Two walls, then: the engine's own (no ADDRESS SYSTEM, no
-// files), and the process's (the sandbox, once the proposed spawn exists),
-// which also holds if the engine itself has a bug.
+// process. Three walls, then: the engine's own (no ADDRESS SYSTEM, no
+// files); this worker's, which locks itself down with sandbox.enforce
+// before the script's first step, so even a bug in the engine is held to
+// no grants (real today); and the process's (sandbox.spawn_socket, once it
+// exists), which also holds against code that goes round std and libc.
 //
 // Built by the Makefile against RexxAE's Aether library (`make rexx`).
 
+import std.audit
 import std.fs
 import std.io
+import std.sandbox
 import std.ipc
 import std.string
 import std.tcp
@@ -47,8 +51,7 @@ request(w: *childbox.Wire, name: string) -> string {
 }
 
 // The worker's own escape attempts: what a bug in the engine could try.
-// These go through std, and so through libc, where the proposed spawn's
-// preload refuses them.
+// They run inside the worker's own sandbox.enforce, which refuses them.
 worker_probes(w: *childbox.Wire) {
     _, ferr = fs.read("/etc/passwd")
     got = if ferr == "" { "ALLOWED" } else { "refused (${ferr})" }
@@ -82,16 +85,52 @@ main() {
     rexxae.rexxae_register_function(ctx, "HOST_REQUEST", 1, 1)
     rexxae.rexxae_register_function(ctx, "WORKER_PROBES", 0, 0)
 
+    // Everything it needed from the disk, it has read. From here on it
+    // grants itself nothing: no files, no network, no processes. A file
+    // comes only as a descriptor the host hands over. This is the
+    // cap_enter shape: start, then lock, with no platform paths anywhere.
+    // `audit_log` is a trusted name: it runs with main's authority.
+    worker = sandbox.new("rexx-worker") {
+    }
+    defer sandbox.free(worker)
+    audit.clear()
+    sandbox.enforce(worker, audit_log) callback {
+        audit_log("rexx-worker locked itself down before the first step: no grants")
+        run(ctx, &w)
+    }
+}
+
+// Sends one line for the host's audit log.
+audit_log(event: string) {
+    w = childbox.wire_new(ipc.parent_channel())
+    childbox.tell(&w, "AUDIT ${event}")
+}
+
+// What the worker's own sandbox refused since the last report, for the
+// host's audit log.
+report_refusals(w: *childbox.Wire) {
+    n = audit.count()
+    i = 0
+    while i < n {
+        cat, res, allowed = audit.entry(i)
+        if allowed == 0 { childbox.tell(w, "AUDIT rexx-worker sandbox refused ${cat} ${res}") }
+        i = i + 1
+    }
+    audit.clear()
+}
+
+// The script, one step at a time, answering each event it raises.
+run(ctx: ptr, w: *childbox.Wire) {
     while true {
         status = rexxae.rexxae_step(ctx, 1000)
         if status == 0 { exit(rexxae.rexxae_exit_code(ctx)) }
         if status == -1 {
             err = string.copy(rexxae.rexxae_error(ctx))
-            childbox.tell(&w, "SAY rexx error: ${err}")
+            childbox.tell(w, "SAY rexx error: ${err}")
             exit(1)
         }
         if status == 1 {
-            childbox.tell(&w, "SAY ${string.copy(rexxae.rexxae_text(ctx))}")
+            childbox.tell(w, "SAY ${string.copy(rexxae.rexxae_text(ctx))}")
         } else if status == 2 {
             // ADDRESS: no environment is mounted, so every command is vetoed.
             address = string.copy(rexxae.rexxae_address(ctx))
@@ -99,17 +138,18 @@ main() {
         } else if status == 4 {
             name = string.copy(rexxae.rexxae_function(ctx))
             if name == "HOST_HEAR" {
-                line, herr = childbox.hear(&w)
+                line, herr = childbox.hear(w)
                 if herr != "" { exit(1) }
                 rexxae.rexxae_reply_value(ctx, json_str(line), "")
             } else if name == "HOST_TELL" {
-                childbox.tell(&w, string.copy(rexxae.rexxae_argument_text(ctx, 0)))
+                childbox.tell(w, string.copy(rexxae.rexxae_argument_text(ctx, 0)))
                 rexxae.rexxae_reply_value(ctx, "true", "")
             } else if name == "HOST_REQUEST" {
                 asked = string.copy(rexxae.rexxae_argument_text(ctx, 0))
-                rexxae.rexxae_reply_value(ctx, request(&w, asked), "")
+                rexxae.rexxae_reply_value(ctx, request(w, asked), "")
             } else if name == "WORKER_PROBES" {
-                worker_probes(&w)
+                worker_probes(w)
+                report_refusals(w)
                 rexxae.rexxae_reply_value(ctx, "true", "")
             }
         }

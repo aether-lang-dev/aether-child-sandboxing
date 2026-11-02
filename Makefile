@@ -4,14 +4,14 @@
 AE ?= ae
 REXXAE ?= ../RexxAE
 
-.PHONY: all python rexx clean
+.PHONY: all python rexx clean build-dir
 
 all: python rexx
 
-python:
+python: build-dir
 	$(AE) run python/host.ae
 
-rexx: build/rexx-guest
+rexx: build-dir build/rexx-guest
 	$(AE) run rexx/host.ae
 
 build/rexx-guest: rexx/guest.ae lib/childbox/module.ae $(REXXAE)/build/aether
@@ -23,3 +23,6 @@ $(REXXAE)/build/aether:
 
 clean:
 	rm -rf build
+
+build-dir:
+	mkdir -p build
