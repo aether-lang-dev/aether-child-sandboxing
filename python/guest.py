@@ -1,60 +1,33 @@
 """The Python showcase's guest: stock python3, standard library only.
 
 It is started by python/host.ae with one end of a socket at the descriptor
-named in AETHER_IPC_FD (3). That socket is its only way out: it answers the
-host's questions, and asks the host for the files it wants. Then it tries to
-get round the host, and reports what happened.
+named in AETHER_IPC_FD (3), and speaks Aether's std.guest protocol through
+aether_guest.py beside it: the host drives it as it drives RexxAE's and the
+JavaScript worker. Its only way out is three functions the host mounts:
+    host_hear()          the host's next message
+    host_tell(line)      a message to the host
+    host_request(name)   ask the host for a file: {granted, text} or {granted, why}
+It answers the host's questions, asks for the files it wants, then tries to
+get round the host, and reports what happened. The host's SCRIPT says which
+run this is: "chat", or "stall" (goes quiet after HELLO; the host's deadline
+cancels it, and the cancel interrupts the sleep).
 """
 
 import ctypes
+import importlib.util
 import os
 import socket
 import sys
+import time
 
-ch = socket.socket(fileno=int(os.environ["AETHER_IPC_FD"]))
-
-# Framing, std.ipc's: a 4-byte big-endian length, then the bytes. At most
-# MAX_FRAME bytes a message. Reads take exactly a frame and never a byte
-# more, so a descriptor riding on the byte after a GRANT frame is left for
-# recv_fds.
-MAX_FRAME = 65536
-
-
-def send(msg):
-    data = msg.encode()
-    assert len(data) <= MAX_FRAME, "message over MAX_FRAME"
-    ch.sendall(len(data).to_bytes(4, "big") + data)
-
-
-def read_exact(n):
-    got = b""
-    while len(got) < n:
-        part = ch.recv(n - len(got))
-        if not part:
-            sys.exit("host went away")
-        got += part
-    return got
-
-
-def recv():
-    size = int.from_bytes(read_exact(4), "big")
-    if size > MAX_FRAME:
-        sys.exit("frame from the host over MAX_FRAME")
-    return read_exact(size).decode()
-
-
-def request(name):
-    """Asks the host for a file by name: its text, or None and the reason."""
-    send(f"REQUEST {name}")
-    reply = recv()
-    if reply.startswith("DENY "):
-        return None, reply[5:]
-    assert reply == f"GRANT {name}", reply
-    # The descriptor rides on the next byte: one recvmsg takes both.
-    payload, fds, _flags, _addr = socket.recv_fds(ch, 1, 1)
-    assert payload == b"F" and len(fds) == 1
-    with os.fdopen(fds[0]) as f:
-        return f.read().strip(), ""
+# aether_guest.py is beside this script. -I leaves this directory off
+# sys.path, and the sandbox grants the two files, not the directory an
+# import would list, so it is loaded by its path.
+sys.dont_write_bytecode = True
+_spec = importlib.util.spec_from_file_location(
+    "aether_guest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "aether_guest.py"))
+aether_guest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(aether_guest)
 
 
 def probe_open(path):
@@ -165,34 +138,38 @@ def probe_connect():
         return f"refused ({e.strerror or e})"
 
 
-stall = "stall" in sys.argv[1:]
+def main(g):
+    hear = g.function("host_hear")
+    tell = g.function("host_tell")
+    request = g.function("host_request")
+    stall = g.script.strip() == "stall"
+    while True:
+        verb, _, rest = hear().partition(" ")
+        if verb == "HELLO":
+            tell(f"HELLO from Python {sys.version.split()[0]}")
+            if stall:
+                # A guest that stops answering: the host's deadline cancels it.
+                time.sleep(3600)
+        elif verb == "ASK":
+            op, a, b = rest.split()
+            tell(f"ANSWER {int(a) * int(b)}" if op == "multiply" else f"ANSWER ? {op}")
 
-while True:
-    msg = recv()
-    verb, _, rest = msg.partition(" ")
-    if verb == "HELLO":
-        send(f"HELLO from Python {sys.version.split()[0]}")
-        if stall:
-            # A guest that stops answering: the host's deadline ends it.
-            import time
-            time.sleep(3600)
-    elif verb == "ASK":
-        op, a, b = rest.split()
-        send(f"ANSWER {int(a) * int(b)}" if op == "multiply" else f"ANSWER ? {op}")
+            # The guest's own turn: it asks the host for things.
+            cfg = request("config")
+            tell(f"SAY config says: {cfg['text'].strip()}" if cfg["granted"] else f"SAY no config: {cfg['why']}")
+            pw = request("/etc/passwd")
+            tell("SAY read /etc/passwd through the host" if pw["granted"]
+                 else f"SAY the host said no: {pw['why']}")
 
-        # The guest's own turn: it asks the host for things.
-        text, why = request("config")
-        send(f"SAY config says: {text}" if text is not None else f"SAY no config: {why}")
-        text, why = request("/etc/passwd")
-        send("SAY read /etc/passwd through the host" if text is not None
-             else f"SAY the host said no: {why}")
+            # And it tries to help itself.
+            tell(f"PROBE open('/etc/passwd'): {probe_open('/etc/passwd')}")
+            tell(f"PROBE dlopen libc by path: {probe_dlopen_libc()}")
+            tell(f"PROBE raw syscall openat('/etc/passwd'): {probe_raw_syscall('/etc/passwd')}")
+            tell(f"PROBE connect 1.1.1.1:443: {probe_connect()}")
+            tell("DONE")
+        elif verb == "BYE":
+            tell("BYE")
+            return 0
 
-        # And it tries to help itself.
-        send(f"PROBE open('/etc/passwd'): {probe_open('/etc/passwd')}")
-        send(f"PROBE dlopen libc by path: {probe_dlopen_libc()}")
-        send(f"PROBE raw syscall openat('/etc/passwd'): {probe_raw_syscall('/etc/passwd')}")
-        send(f"PROBE connect 1.1.1.1:443: {probe_connect()}")
-        send("DONE")
-    elif verb == "BYE":
-        send("BYE")
-        break
+
+aether_guest.open("python-guest").run(main)

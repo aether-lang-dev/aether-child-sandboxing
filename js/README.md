@@ -16,20 +16,21 @@ grants before any JavaScript runs.
 | File | What it is |
 |---|---|
 | `host.ae` | The host: the mounted functions, the request policy, the spawn and the conversation |
-| `worker.ae` | `js-worker`: the engine, the worker protocol, the lockdown, cancel |
+| `worker.ae` | `js-worker`: the engine glue on `std.guest.child` (the ROM's host functions, the mounts as JavaScript, the interrupt hook) |
 | `chat.js` | The script: the conversation, file requests, and the escape probes |
 | `stuck.js` | `while (true) {}`, cancelled at the deadline |
 | `big.js` | A message over the 64 KiB limit, refused |
-| `test_worker.ae` | `make js-test`: 11 cases, contained on Linux |
+| `test_worker.ae` | `make js-test`: 12 cases, contained on Linux |
 | `rom/`, `rom.c`, `.build.ae`, `mqjs`, `ae`, `gen` | Building the engine with the one global the host needs (`__host_call`) |
 
-`js-worker` speaks the same protocol as RexxAE's worker, so `host.ae` drives
-it with RexxAE's `rexxworker` module.
+`js-worker` is built on Aether's `std.guest.child`, as RexxAE's worker is,
+so `host.ae` drives it with `std.guest`.
 
 ## Run it
 
-You need Aether 0.873.0 or later, `aeb` v0.333 or later, and checkouts of
-RexxAE (`../RexxAE`) and mquickjs-ae (`../mquickjs-ae`) next to this repo.
+You need an Aether with `std.guest` (see the top-level README), `aeb` v0.333
+or later, and checkouts of RexxAE (`../RexxAE`, for the stand-in worker that
+never answers) and mquickjs-ae (`../mquickjs-ae`) next to this repo.
 From the repo root:
 
 ```sh
@@ -51,10 +52,11 @@ asked for by name.
 
 As with the Rexx worker, `js-worker` runs **any** script; you don't rebuild
 it.
-1. Launch it with `rexxworker.launch`, granting nothing.
-2. Mount the functions your scripts may call (`rexxworker.mount(&w,
+1. Launch it with `guest.launch(perms, prog, null, name, audit_log)`,
+   granting nothing.
+2. Mount the functions your scripts may call (`guest.mount(&w,
    "hostRequest", 1, 1)`) and send the script.
-3. Answer `CALL` events in a loop on `rexxworker.next`, which applies the
+3. Answer `CALL` events in a loop on `guest.next`, which applies the
    deadline.
 
 See `host.ae`, and `../rexx/README.md` for the same steps in more detail.

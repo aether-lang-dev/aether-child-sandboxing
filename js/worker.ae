@@ -1,44 +1,34 @@
 // js-worker: runs one JavaScript program for a host in another process, on
 // mquickjs-ae (the Aether port of MicroQuickJS), compiled in.
 //
-// The protocol is RexxAE's worker protocol, unchanged, so the host drives
-// this worker with RexxAE's host module (rexxworker; js/host.ae):
-//
-//   host -> worker   MOUNT <name> <min> <max>   before SCRIPT, one a function
-//                    PROBE                      before SCRIPT: self-check
-//                    SCRIPT <source>            lock down and run
-//                    REPLY <json> | FAIL <why> | FILE (then a descriptor)
-//                    CANCEL <reason>
-//   worker -> host   SAY <text> | CALL <name> <json array> | AUDIT <text>
-//                    DONE <code> | ERROR <message>
+// The protocol, and everything about it on this side (the mounts and the
+// script, the lockdown, the PROBE self-check, CANCEL, LOGLEVEL, a file
+// handed over as a descriptor), is Aether's std.guest.child; its README
+// (std/guest/README.md) has every message, and the host drives this worker
+// with std.guest (js/host.ae). What is here is the engine glue: the ROM's
+// host functions, the mounts as JavaScript, and the interrupt hook.
 //
 // Three walls, as in RexxAE's worker. The engine's own: the ROM this worker
 // is built with (js/rom) has the language, console.log, print and
 // performance.now, and no file, network, module or FFI API at all; the only
 // way out is __host_call, a frame to the host, which only answers names the
 // host mounted. This worker's: once it has the script it enters
-// sandbox.enforce with no grants, before the first JavaScript runs. And the
-// process sandbox the host spawned it in.
+// sandbox.enforce with no grants (child.run), before the first JavaScript
+// runs. And the process sandbox the host spawned it in.
 //
 // Cancel. MicroQuickJS runs a script to the end in one JS_Eval, so there
 // are no steps to take between: instead the engine calls jsw_interrupt
 // every 10000 calls and backward jumps, which looks for a CANCEL on the
-// socket without waiting. On one it returns 1 and the engine throws an
-// error the script cannot catch. A script waiting on the host in a mounted
+// socket without waiting (child.poll). On one it returns 1 and the engine
+// throws an error the script cannot catch. A script waiting on the host in a mounted
 // function gets the CANCEL as its reply. Either way the worker answers
 // ERROR "cancelled by host: <reason>".
 
-import std.audit
 import std.bytes
-import std.fs
-import std.io
-import std.ipc
-import std.list
+import std.guest.child
 import std.mem
 import std.os
-import std.sandbox
 import std.string
-import std.tcp
 
 extern JS_NewContext(mem_start: ptr, mem_size: long, stdlib_def: ptr) -> ptr
 extern JS_FreeContext(ctx: ptr)
@@ -62,10 +52,6 @@ extern jsw_raw_open(path: string) -> int
 extern jsw_raw_open_kind() -> string
 extern jsw_strerror(e: int) -> string
 
-// The largest frame either side accepts (rexxworker.MAX_FRAME), and the
-// largest file a FILE reply is read up to.
-const MAX_FRAME = 65536
-const MAX_FILE = 65536
 // The JavaScript heap: MicroQuickJS allocates nothing else, and runs out
 // with a catchable error.
 const HEAP = 1048576
@@ -77,101 +63,70 @@ const JS_EXCEPTION = 15
 const FRAME_CF_CTOR = 65536
 
 main() {
-    ch = ipc.parent_channel()
-    if ch < 0 {
-        println("js-worker: no parent channel; a host starts this with rexxworker.launch")
+    h, err = child.open("js-worker")
+    if err != "" {
+        println(err)
         exit(2)
     }
-
-    // Before the script: the functions to mount, whether to self-check, and
-    // the script. Everything the worker needs arrives here.
-    mounts = list.new()
-    probe = 0
-    source = ""
-    while true {
-        data, err = ipc.read_frame(ch, MAX_FRAME)
-        if err != "" { exit(1) }
-        verb, rest = split_verb_(data)
-        if verb == "SCRIPT" {
-            source = rest
-            break
-        }
-        if verb == "MOUNT" {
-            merr = check_mount_(rest)
-            if merr != "" {
-                tell_(ch, "ERROR ${merr}")
-                exit(1)
-            }
-            list.add(mounts, rest)
-        } else if verb == "PROBE" {
-            probe = 1
-        } else {
-            tell_(ch, "ERROR protocol: expected MOUNT, PROBE or SCRIPT, got '${verb}'")
+    // The mounts, PROBE, LOGLEVEL and the script; a protocol error has been
+    // sent to the host as ERROR. This engine has no log calls, so a
+    // LOGLEVEL changes nothing it sends.
+    if child.read_script(h) != "" { exit(1) }
+    n = child.mount_count(h)
+    i = 0
+    while i < n {
+        name, _lo, _hi = child.mount_at(h, i)
+        if !is_identifier_(name) {
+            child.error(h, "cannot mount '${name}': not a JavaScript identifier")
             exit(1)
         }
+        i = i + 1
     }
 
-    // The engine's state for the host functions: the mounts and, once one
-    // has come, the CANCEL's reason.
-    state = malloc(16)
-    mem.set_ptr(state, 0, mounts)
-    mem.set_ptr(state, 8, list.new())
+    // The engine's state for the host functions is the Host itself.
     heap = malloc(HEAP)
     ctx = JS_NewContext(heap, HEAP, jsw_stdlib())
-    JS_SetContextOpaque(ctx, state)
+    JS_SetContextOpaque(ctx, h as ptr)
     jsw_install_interrupt(ctx)
 
     // From here on it grants itself nothing: no files, no network, no
-    // processes, with no platform path anywhere. `audit_log` is a trusted
-    // name: it runs with main's authority.
-    worker = sandbox.new("js-worker") {
-    }
-    defer sandbox.free(worker)
-    audit.clear()
-    sandbox.enforce(worker, audit_log) callback {
-        audit_log("js-worker locked itself down before the first step: no grants")
-        if probe == 1 { self_probe_(ch) }
-        run_(ctx, ch, mounts, source)
+    // processes, with no platform path anywhere.
+    child.run(h) callback {
+        if h.probe == 1 { raw_probe_(h) }
+        run_js_(ctx, h)
     }
     JS_FreeContext(ctx)
     free(heap)
     exit(0)
 }
 
-// "name min max": a JavaScript identifier and two arities.
-check_mount_(spec: string) -> string {
-    parts = string.split(spec, " ")
-    defer string.array_free(parts)
-    if string.array_size(parts) != 3 { return "protocol: MOUNT wants NAME min max" }
-    name = string.array_get(parts, 0)
+// The Host the context was made for.
+host_(ctx: ptr) -> *child.Host {
+    return JS_GetContextOpaque(ctx) as *child.Host
+}
+
+// A JavaScript identifier: letters, digits (not first), _ and $.
+is_identifier_(name: string) -> bool {
     n = string.length(name)
-    if n == 0 { return "protocol: MOUNT with no name" }
+    if n == 0 { return false }
     i = 0
     while i < n {
         c = string.char_at(name, i)
         ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36 || (i > 0 && c >= 48 && c <= 57)
-        if !ok { return "cannot mount '${name}': not a JavaScript identifier" }
+        if !ok { return false }
         i = i + 1
     }
-    _, lerr = string.to_int(string.array_get(parts, 1))
-    _, herr = string.to_int(string.array_get(parts, 2))
-    if lerr != "" || herr != "" { return "protocol: MOUNT ${name}: arity is not a number" }
-    return ""
+    return true
 }
 
 // The mounted functions, as JavaScript: each a wrapper that checks its
 // arity and makes one __host_call with its arguments as JSON.
-prelude_(mounts: ptr) -> string {
+prelude_(h: *child.Host) -> string {
     out = "function __host_wrap(n, lo, hi, a) {\n  if (a.length < lo || a.length > hi) throw new TypeError(n + ' takes ' + lo + ' to ' + hi + ' arguments');\n  var l = [];\n  for (var i = 0; i < a.length; i++) l.push(a[i]);\n  return JSON.parse(__host_call(n, JSON.stringify(l)));\n}\n"
-    n = list.size(mounts)
+    n = child.mount_count(h)
     i = 0
     while i < n {
-        spec, _ = list.get_string(mounts, i)
-        parts = string.split(spec, " ")
-        name = string.copy(string.array_get(parts, 0))
-        lo = string.copy(string.array_get(parts, 1))
-        hi = string.copy(string.array_get(parts, 2))
-        string.array_free(parts)
+        name, lo, hi = child.mount_at(h, i)
         out = "${out}var ${name} = function () { return __host_wrap('${name}', ${lo}, ${hi}, arguments); };\n"
         i = i + 1
     }
@@ -179,25 +134,23 @@ prelude_(mounts: ptr) -> string {
 }
 
 // The script: the mounts' prelude, then the program, each one JS_Eval.
-run_(ctx: ptr, ch: int, mounts: ptr, source: string) {
-    pre = prelude_(mounts)
+run_js_(ctx: ptr, h: *child.Host) {
+    pre = prelude_(h)
     v = JS_Eval(ctx, pre, string.length(pre), "<mounts>", 0)
     if v == JS_EXCEPTION {
-        tell_(ch, "ERROR mounting: ${exception_text_(ctx)}")
+        child.error(h, "mounting: ${exception_text_(ctx)}")
         return
     }
-    v = JS_Eval(ctx, source, string.length(source), "guest.js", 0)
-    report_refusals_(ch)
-    why = cancel_reason_(ctx)
-    if why != "" {
-        tell_(ch, "ERROR cancelled by host: ${why}")
+    v = JS_Eval(ctx, h.source, string.length(h.source), "guest.js", 0)
+    if h.cancel != "" {
+        child.error(h, "cancelled by host: ${h.cancel}")
         return
     }
     if v == JS_EXCEPTION {
-        tell_(ch, "ERROR ${exception_text_(ctx)}")
+        child.error(h, exception_text_(ctx))
         return
     }
-    tell_(ch, "DONE 0")
+    child.done(h, 0)
 }
 
 // The pending exception, as text ("TypeError: ...").
@@ -221,44 +174,18 @@ arg_text_(ctx: ptr, argv: ptr, i: int) -> string {
     return to_text_(ctx, mem.get_long(argv, i * 8))
 }
 
-// The CANCEL's reason, or "" when none has come.
-cancel_reason_(ctx: ptr) -> string {
-    st = JS_GetContextOpaque(ctx)
-    cancels = mem.get_ptr(st, 8)
-    if list.size(cancels) == 0 { return "" }
-    why, _ = list.get_string(cancels, 0)
-    return why
-}
-
-set_cancel_(ctx: ptr, why: string) {
-    st = JS_GetContextOpaque(ctx)
-    cancels = mem.get_ptr(st, 8)
-    if list.size(cancels) == 0 { list.add(cancels, why) }
-}
-
-// The engine's interrupt hook (js/rom.c installs it): 1 stops the script.
-// A CANCEL, or any frame at all, since the host has nothing else to send
-// while the script runs.
+// The engine's interrupt hook (js/rom.c installs it): 1 stops the script,
+// once the host has cancelled. A LOGLEVEL is taken on the way; any other
+// frame while the script runs breaks the protocol, and cancels too.
 jsw_interrupt(ctx: ptr, opaque: ptr) -> int {
-    if cancel_reason_(ctx) != "" { return 1 }
-    ch = ipc.parent_channel()
-    ready, werr = ipc.wait_readable(ch, 0)
-    if werr != "" { exit(1) }
-    if ready == 0 { return 0 }
-    data, rerr = ipc.read_frame(ch, MAX_FRAME)
-    if rerr != "" { exit(1) }
-    verb, rest = split_verb_(data)
-    if verb == "CANCEL" {
-        set_cancel_(ctx, rest)
-    } else {
-        set_cancel_(ctx, "protocol: unexpected '${verb}' while the script runs")
-    }
-    return 1
+    if child.poll(host_(ctx)) != "" { return 1 }
+    return 0
 }
 
 // print(...) and console.log(...): one SAY.
 js_print(ctx: ptr, this_val: ptr, argc: int, argv: ptr) -> long {
-    if cancel_reason_(ctx) != "" { return jsw_throw(ctx, "cancelled by host") }
+    h = host_(ctx)
+    if h.cancel != "" { return jsw_throw(ctx, "cancelled by host") }
     line = ""
     i = 0
     while i < argc {
@@ -266,7 +193,7 @@ js_print(ctx: ptr, this_val: ptr, argc: int, argv: ptr) -> long {
         line = "${line}${arg_text_(ctx, argv, i)}"
         i = i + 1
     }
-    tell_(ipc.parent_channel(), "SAY ${line}")
+    child.say(h, line)
     return JS_UNDEFINED
 }
 
@@ -274,43 +201,16 @@ js_print(ctx: ptr, this_val: ptr, argc: int, argv: ptr) -> long {
 // Returns the REPLY's JSON text (the wrapper parses it); throws on FAIL, on
 // CANCEL, and for a name the host did not mount.
 js_host_call(ctx: ptr, this_val: ptr, argc: int, argv: ptr) -> long {
-    why = cancel_reason_(ctx)
-    if why != "" { return jsw_throw(ctx, "cancelled by host: ${why}") }
+    h = host_(ctx)
+    if h.cancel != "" { return jsw_throw(ctx, "cancelled by host: ${h.cancel}") }
     if argc != 2 { return jsw_throw(ctx, "__host_call takes a name and its arguments as JSON") }
     name = arg_text_(ctx, argv, 0)
     args = arg_text_(ctx, argv, 1)
-    if !is_mounted_(ctx, name) { return jsw_throw(ctx, "${name} is not a function the host mounted") }
-    ch = ipc.parent_channel()
-    report_refusals_(ch)
-    tell_(ch, "CALL ${name} ${args}")
-    data, err = ipc.read_frame(ch, MAX_FRAME)
-    if err != "" { exit(1) }
-    verb, rest = split_verb_(data)
-    if verb == "REPLY" { return JS_NewString(ctx, rest) }
-    if verb == "FAIL" {
-        msg = if rest == "" { "host function failed" } else { rest }
-        return jsw_throw(ctx, msg)
-    }
-    if verb == "FILE" { return JS_NewString(ctx, take_file_(ch)) }
-    if verb == "CANCEL" {
-        set_cancel_(ctx, rest)
-    } else {
-        set_cancel_(ctx, "protocol: unexpected '${verb}' for a reply")
-    }
-    return jsw_throw(ctx, "cancelled by host: ${cancel_reason_(ctx)}")
-}
-
-is_mounted_(ctx: ptr, name: string) -> bool {
-    st = JS_GetContextOpaque(ctx)
-    mounts = mem.get_ptr(st, 0)
-    n = list.size(mounts)
-    i = 0
-    while i < n {
-        spec, _ = list.get_string(mounts, i)
-        if string.starts_with(spec, "${name} ") == 1 { return true }
-        i = i + 1
-    }
-    return false
+    if !child.is_mounted(h, name) { return jsw_throw(ctx, "${name} is not a function the host mounted") }
+    r = child.call_host(h, name, args)
+    if r.kind == "VALUE" { return JS_NewString(ctx, r.text) }
+    if r.kind == "FAIL" { return jsw_throw(ctx, r.text) }
+    return jsw_throw(ctx, "cancelled by host: ${r.text}")
 }
 
 // Date and performance.now: the clock is not a wall (the ROM names these).
@@ -339,97 +239,12 @@ js_date_constructor(ctx: ptr, this_val: ptr, argc: int, argv: ptr) -> long {
     return JS_NewDate(ctx, val)
 }
 
-// One line for the host's audit log.
-audit_log(event: string) {
-    tell_(ipc.parent_channel(), "AUDIT ${event}")
-}
-
-// Sends one frame; a host that has gone away ends the worker.
-tell_(ch: int, msg: string) {
-    if ipc.write_frame(ch, msg) != "" { exit(1) }
-}
-
-// What this worker's own sandbox refused since the last report.
-report_refusals_(ch: int) {
-    n = audit.count()
-    if n == 0 { return }
-    i = 0
-    while i < n {
-        cat, res, allowed = audit.entry(i)
-        if allowed == 0 { tell_(ch, "AUDIT js-worker sandbox refused ${cat} ${res}") }
-        i = i + 1
-    }
-    audit.clear()
-}
-
-// PROBE: what a bug in the engine could try, from inside the lockdown:
-// std's file and network calls, which the worker's own enforce answers,
-// and an open round std (on Linux the openat system call instruction
-// itself, round libc and the preload too), which only the process
-// sandbox's kernel layer can answer.
-self_probe_(ch: int) {
-    _, ferr = fs.read("/etc/passwd")
-    got = if ferr == "" { "ALLOWED" } else { "refused (${ferr})" }
-    tell_(ch, "AUDIT probe worker fs.read('/etc/passwd'): ${got}")
-    conn, cerr = tcp.connect("1.1.1.1", 443)
-    if cerr == "" {
-        tcp.close(conn)
-        tell_(ch, "AUDIT probe worker tcp.connect 1.1.1.1:443: ALLOWED")
-    } else {
-        tell_(ch, "AUDIT probe worker tcp.connect 1.1.1.1:443: refused (${cerr})")
-    }
+// PROBE, on top of std.guest.child's (std's file and network calls, which
+// the worker's own enforce answers): an open round std (on Linux the
+// openat system call instruction itself, round libc and the preload too),
+// which only the process sandbox's kernel layer can answer.
+raw_probe_(h: *child.Host) {
     e = jsw_raw_open("/etc/passwd")
     raw = if e == 0 { "ALLOWED" } else { "refused (${string.copy(jsw_strerror(e))})" }
-    tell_(ch, "AUDIT probe worker ${string.copy(jsw_raw_open_kind())}('/etc/passwd'), round std: ${raw}")
-    report_refusals_(ch)
-}
-
-// FILE: the descriptor rides on the next byte; read it, close it, and give
-// the script {"granted":true,"text":...}.
-take_file_(ch: int) -> string {
-    _, fd, rerr = ipc.recv(ch, 1)
-    if rerr != "" { return "{\"granted\":false,\"why\":${json_string_(rerr)}}" }
-    if fd < 0 { return "{\"granted\":false,\"why\":\"no descriptor came with FILE\"}" }
-    text, count, ferr = io.fd_read_n(fd, MAX_FILE + 1)
-    io.fd_close(fd)
-    if ferr != "" { return "{\"granted\":false,\"why\":${json_string_(ferr)}}" }
-    if count > MAX_FILE { return "{\"granted\":false,\"why\":\"file larger than ${MAX_FILE} bytes\"}" }
-    return "{\"granted\":true,\"text\":${json_string_(text)}}"
-}
-
-// `s` as a JSON string literal.
-json_string_(s: string) -> string {
-    hex = "0123456789abcdef"
-    out = "\""
-    seg = 0
-    i = 0
-    n = string.length(s)
-    while i < n {
-        c = string.char_at(s, i)
-        if c == 34 || c == 92 || (c >= 0 && c < 32) {
-            out = string.concat(out, string.substring(s, seg, i))
-            if c == 34 {
-                out = string.concat(out, "\\\"")
-            } else if c == 92 {
-                out = string.concat(out, "\\\\")
-            } else if c == 10 {
-                out = string.concat(out, "\\n")
-            } else {
-                hi = c / 16
-                lo = c % 16
-                out = string.concat(out, "\\u00${string.substring(hex, hi, hi + 1)}${string.substring(hex, lo, lo + 1)}")
-            }
-            seg = i + 1
-        }
-        i = i + 1
-    }
-    out = string.concat(out, string.substring(s, seg, n))
-    return string.concat(out, "\"")
-}
-
-// "VERB the rest" -> ("VERB", "the rest").
-split_verb_(line: string) -> (string, string) {
-    at = string.index_of(line, " ")
-    if at < 0 { return line, "" }
-    return string.substring(line, 0, at), string.substring(line, at + 1, string.length(line))
+    child.audit(h, "probe worker ${string.copy(jsw_raw_open_kind())}('/etc/passwd'), round std: ${raw}")
 }

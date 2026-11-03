@@ -1,22 +1,32 @@
 // The Python showcase's host: runs python/guest.py in a sandboxed child
 // process (sandbox.spawn_socket) and talks to it, both ways, over std.ipc.
+// The same conversation as rexx/host.ae and js/host.ae, line for line, and
+// the same module, std.guest: the guest speaks its protocol through
+// python/aether_guest.py, standard library only.
 //
 // The guest is the stock python3 with nothing added: no Aether bridge, no
 // libpython ABI to match. It gets one thing, the socket at fd 3, and asks
-// the host for everything else.
+// the host for everything else, through three functions the host mounts:
+//   host_hear()          the host's next message
+//   host_tell(line)      a message to the host
+//   host_request(name)   ask for a file: {granted: True, text: ...}, or no
+// std.guest bounds every exchange with a deadline: a guest that goes quiet
+// is sent CANCEL, which interrupts it wherever it is, and one that does not
+// answer that is killed.
 //
 // Run (from the repo root): make python
 //   args: [stall] [uncontained]
-//   stall        the guest goes quiet after HELLO: the deadline kills it
-//   uncontained  sandbox.spawn_socket_uncontained, by name (make UNCONTAINED=1)
+//   stall        the guest goes quiet after HELLO: the deadline cancels it
+//   uncontained  guest.launch_uncontained, by name (make UNCONTAINED=1)
 
-import std.io
 import std.list
 import std.os
 import std.sandbox
+import std.guest
 import childbox
 
 const GUEST = "python/guest.py"
+const MODULE = "python/aether_guest.py"
 
 main() {
     stall = 0
@@ -29,13 +39,15 @@ main() {
     }
 
     // What the guest may do on its own: read the interpreter's own library,
-    // which python3 itself is asked for (no platform paths here), and its
-    // script. Nothing else: no files of ours, no network, no processes.
-    guest = sandbox.new("python-guest") {
+    // which python3 itself is asked for (no platform paths here), its script
+    // and the protocol module beside it. Nothing else: no files of ours, no
+    // network, no processes.
+    perms = sandbox.new("python-guest") {
         grant_runtime("python3")
         grant_fs_read("${os.getcwd()}/${GUEST}")
+        grant_fs_read("${os.getcwd()}/${MODULE}")
     }
-    defer sandbox.free(guest)
+    defer sandbox.free(perms)
 
     // What the guest may ASK for: one logical name, mapped to a file here.
     policy = |name: string| {
@@ -48,26 +60,27 @@ main() {
     argv = list.new()
     list.add(argv, "-I")
     list.add(argv, GUEST)
-    if stall == 1 { list.add(argv, "stall") }
-    ch, pid, err = childbox.start_guest(guest, "python3", argv, uncontained)
+    w, err = start_worker(perms, argv, session, uncontained)
     list.free(argv)
     if err != "" {
         println("spawn refused: ${err}")
         exit(1)
     }
-
-    println("conversation (permission decisions also go to ${childbox.AUDIT_LOG}):")
-    cerr = childbox.converse(ch, session, policy)
-    if cerr != "" {
-        // A guest that broke the protocol or went quiet may still be
-        // running: hang up and stop it rather than wait on it.
-        println("conversation ended: ${cerr}")
-        io.fd_close(ch)
-        os.kill(pid, 9)
-        childbox.audit_log("${session} KILLED after: ${cerr}")
-        println("  host: guest killed")
-    } else {
-        io.fd_close(ch)
+    if uncontained == 1 {
+        println("[python host] guest.launch_uncontained: the guest runs with NO process sandbox")
     }
-    os.wait_pid(pid)
+    guest.mount(&w, "host_hear", 0, 0)
+    guest.mount(&w, "host_tell", 1, 1)
+    guest.mount(&w, "host_request", 1, 1)
+    guest.start(&w, if stall == 1 { "stall" } else { "chat" })
+
+    childbox.converse(&w, session, "host_hear", "host_tell", "host_request", policy)
+}
+
+// python3 in sandbox.spawn_socket, or, asked for by name, without it.
+start_worker(perms: sandbox.Grants, argv: ptr, session: string, uncontained: int) -> (guest.Guest, string) {
+    if uncontained == 1 {
+        return guest.launch_uncontained(perms, "python3", argv, session, childbox.AUDIT_LOG)
+    }
+    return guest.launch(perms, "python3", argv, session, childbox.AUDIT_LOG)
 }

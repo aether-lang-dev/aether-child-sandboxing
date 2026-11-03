@@ -1,6 +1,6 @@
-# Needs Aether 0.873.0 or later (sandbox.spawn_socket, std.ipc frames).
-# AE defaults to the ae on PATH, AETHER_HOME to your environment's (an installed
-# release sets it); set both to build with another Aether tree.
+# Needs an Aether with std.guest and std.guest.child (not in a release yet:
+# set AE and AETHER_HOME to an Aether tree that has them). AE defaults to the
+# ae on PATH, AETHER_HOME to your environment's (an installed release sets it).
 # RexxAE's worker and the programs here are built by the same ae.
 #
 #   make python              the Python showcase, then a guest that goes quiet
@@ -53,16 +53,16 @@ js-test: build/js-test $(JS_WORKER) $(SILENT)
 	./build/js-test
 
 build/python-host: python/host.ae lib/childbox/module.ae | build-dir
-	$(AE) build python/host.ae -o $@
+	$(AE) build python/host.ae --lib lib -o $@
 
-build/rexx-host: rexx/host.ae lib/childbox/module.ae $(REXXAE)/worker/rexxworker/module.ae | build-dir
-	$(AE) build rexx/host.ae --lib lib --lib $(REXXAE)/worker -o $@
+build/rexx-host: rexx/host.ae lib/childbox/module.ae | build-dir
+	$(AE) build rexx/host.ae --lib lib -o $@
 
-build/js-host: js/host.ae lib/childbox/module.ae $(REXXAE)/worker/rexxworker/module.ae | build-dir
-	$(AE) build js/host.ae --lib lib --lib $(REXXAE)/worker -o $@
+build/js-host: js/host.ae lib/childbox/module.ae | build-dir
+	$(AE) build js/host.ae --lib lib -o $@
 
-build/js-test: js/test_worker.ae $(REXXAE)/worker/rexxworker/module.ae | build-dir
-	$(AE) build js/test_worker.ae --lib $(REXXAE)/worker -o $@
+build/js-test: js/test_worker.ae | build-dir
+	$(AE) build js/test_worker.ae -o $@
 
 # mquickjs-ae's engine, the worker and the ROM generated for it (js/.build.ae).
 $(JS_WORKER): FORCE

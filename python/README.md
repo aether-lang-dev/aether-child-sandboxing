@@ -1,7 +1,9 @@
 # Python guest
 
 An Aether program (`host.ae`) runs a stock `python3` script (`guest.py`) in a
-sandboxed child process and talks to it over a socket. The guest asks the host
+sandboxed child process and talks to it over a socket, with Aether's
+`std.guest`: the same host module, and the same protocol, as the Rexx and
+JavaScript workers. The guest asks the host
 for files by name; the host hands one over as an open file descriptor or says
 no. Then the guest tries to get round the host, and reports what happened.
 
@@ -10,13 +12,15 @@ guest.py`, standard library only.
 
 | File | What it is |
 |---|---|
-| `host.ae` | The host: the guest's grants, its request policy, the spawn and the conversation |
-| `guest.py` | The guest: message framing, the conversation, and the escape probes |
-| `../lib/childbox/` | Shared host-side helpers: framing with deadlines, GRANT/DENY, the audit log |
+| `host.ae` | The host: the guest's grants, its request policy, the spawn and the mounted functions |
+| `guest.py` | The guest: the conversation, and the escape probes |
+| `aether_guest.py` | The guest's side of `std.guest`'s protocol in Python, standard library only: frames, mounted functions, a granted file, LOG, and CANCEL |
+| `../lib/childbox/` | The showcase's conversation, shared by the three hosts, and the audit log |
 
 ## Run it
 
-You need Aether 0.873.0 or later and `python3` 3.9 or newer. From the repo
+You need an Aether with `std.guest` (see the top-level README) and `python3`
+3.9 or newer. From the repo
 root:
 
 ```sh
@@ -24,9 +28,14 @@ make python
 ```
 
 That builds `build/python-host`, runs the conversation, then runs a guest
-that goes quiet after its first message, which the host kills at the
-5-second deadline. Every GRANT, DENY, timeout and kill also goes to
-`build/audit.log`.
+that goes quiet after its first message (a `time.sleep(3600)`). At the
+5-second deadline the host sends `CANCEL`, and the guest stops politely:
+
+```
+  worker: ERROR cancelled by host: deadline of 5000 ms passed
+```
+
+Every GRANT, DENY, timeout, cancel and kill also goes to `build/audit.log`.
 
 Contained runs need **Linux with Landlock** (kernel 5.13 or later; 6.7 or
 later for the network rules). Elsewhere the spawn refuses and starts nothing.
@@ -73,18 +82,35 @@ On the **host** side (`host.ae`) you write three things:
    }
    ```
 
-3. **The spawn and the conversation.** `childbox.start_guest` calls
-   `sandbox.spawn_socket` (or `spawn_socket_uncontained`, only when asked),
-   and `childbox.converse` runs the exchange with a deadline on every wait.
-   Replace `childbox.respond` with your own protocol.
+3. **The spawn and the conversation.** `guest.launch` calls
+   `sandbox.spawn_socket` (or `guest.launch_uncontained`, only when asked)
+   with `-I guest.py` as python3's arguments; `guest.mount` names the
+   functions the guest may call, `guest.start` sends its `SCRIPT` (here,
+   which run it is), and `guest.next` returns each `CALL`, with a deadline
+   on every wait.
 
-On the **guest** side (`guest.py`) the socket is the descriptor in
-`AETHER_IPC_FD` (3). Copy `send`, `recv` and `request` from `guest.py`:
+On the **guest** side, copy `aether_guest.py` beside your script:
 
-- every message is a 4-byte big-endian length, then the bytes, at most
-  65536 bytes;
-- to get a file, send `REQUEST <name>`; the reply is `DENY <why>`, or
-  `GRANT <name>` followed by the descriptor, taken with `socket.recv_fds`.
+```python
+import aether_guest
+
+def main(g):
+    request = g.function("host_request")     # mounted by the host
+    cfg = request("config")                  # a CALL; waits for the answer
+    if cfg["granted"]:
+        g.say(cfg["text"])
+    return 0                                 # DONE 0
+
+aether_guest.open("my-guest").run(main)
+```
+
+A mounted function is held to the arity the host gave it; its arguments
+and result cross as JSON, and a granted file arrives as an open
+descriptor, read for you into `{"granted": True, "text": ...}`. A host
+`FAIL` raises `HostFailed`. A host `CANCEL` raises `Cancelled` wherever
+the program is (a reader thread owns the socket and signals the main
+thread), and `run` reports it as `ERROR cancelled by host: <reason>`; a
+guest that does not answer is killed after the host's grace.
 
 The probe functions are only there to show the walls; your guest doesn't need
 them.

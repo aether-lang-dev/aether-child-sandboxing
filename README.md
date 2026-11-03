@@ -1,11 +1,15 @@
 # aether-child-sandboxing
 
-> **Status: runs on Aether 0.873.0 or later.** All three guests run on
-> the real calls, `sandbox.spawn_socket` and `std.ipc`'s frames, which
-> arrived in 0.873.0 through
-> [aether#3510](https://github.com/aether-lang-dev/aether/pull/3510).
-> The Rexx worker is on [RexxAE](https://github.com/aether-lang-dev/RexxAE)'s `main`; the JavaScript worker uses RexxAE's
-> host module from there, and [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae)'s `main`. Discussion and
+> **Status: needs an Aether with `std.guest` (the PR adding it to Aether;
+> the first release after 0.875.0).** All three guests run on the real calls,
+> `sandbox.spawn_socket` and `std.ipc`'s frames (Aether 0.873.0, through
+> [aether#3510](https://github.com/aether-lang-dev/aether/pull/3510)), and
+> all three hosts drive their guest with Aether's `std.guest`; the Aether
+> workers (RexxAE's and `js-worker`) are built on `std.guest.child`, and the
+> Python guest speaks the same protocol through `python/aether_guest.py`.
+> The Rexx worker is [RexxAE](https://github.com/aether-lang-dev/RexxAE)'s
+> (its `std.guest.child` move is a local commit until that Aether release);
+> the JavaScript worker uses [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae)'s `main`. Discussion and
 > decisions: [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
 An Aether host runs a guest language **in a separate, sandboxed child
@@ -49,26 +53,33 @@ Python 3.14) with the aether branch above:**
   Python raw-syscall probe is refused.
 - `std.ipc`'s length-prefixed frames (`ipc.write_frame`,
   `ipc.read_frame_timeout`), a 4-byte big-endian length with a 64 KiB cap;
-  the Python guest reads and writes the same header. The framing code in
-  `lib/childbox` is gone.
+  the Python guest reads and writes the same header.
 - A granted file handed over as an open descriptor on the byte after a
   `GRANT` frame, taken with one receive (`ipc.recv`, or Python's
   `socket.recv_fds`): no `TAKE` step. The host end refuses descriptors
   sent up by a guest (std.ipc's rule).
-- A deadline on every exchange. The Python host hangs up and kills a guest
-  that stays quiet past it (`make python` runs one). The Rexx host uses
-  RexxAE's worker, whose host side sends `CANCEL` when the deadline passes;
-  the worker stops the script with `rexxae_cancel`, so a script waiting in
-  `HOST_HEAR` for a message that never comes ends with
-  `cancelled by host` (`make rexx` runs one), and a worker that does not
-  answer is killed.
+- A deadline on every exchange, from `std.guest`: when it passes the host
+  sends `CANCEL`, and a guest that does not answer within the grace is
+  killed. RexxAE's worker stops the script with `rexxae_cancel`, so a
+  script waiting in `HOST_HEAR` for a message that never comes ends with
+  `cancelled by host` (`make rexx` runs one). The Python guest's reader
+  thread signals the main thread, which raises `Cancelled` wherever the
+  program is, a `time.sleep(3600)` included (`make python` runs one).
 - RexxAE's generic worker (`../RexxAE/worker`): any script, any mounted
-  functions, locking itself down with `sandbox.enforce` and no grants
-  before its first step. `rexx/guest.ae` is gone.
-- `js-worker` (`js/worker.ae`): mquickjs-ae's engine compiled in, speaking
-  RexxAE's worker protocol unchanged, so `js/host.ae` drives it with
-  RexxAE's host module, `rexxworker`. It locks itself down the same way,
-  before the first JavaScript runs, and is spawned with no grants.
+  functions, on `std.guest.child`, locking itself down with
+  `sandbox.enforce` and no grants before its first step.
+- **The protocol in Aether's standard library.** `std.guest` (the host's
+  side) and `std.guest.child` (an Aether worker's) were RexxAE's
+  `rexxworker` and the shared half of the two workers; the protocol is
+  documented once, in Aether's `std/guest/README.md`. The Python guest
+  speaks it with `python/aether_guest.py`, standard library only, so all
+  three hosts are the same program with other names.
+- `js-worker` (`js/worker.ae`): mquickjs-ae's engine compiled in, on
+  `std.guest.child`, so `js/host.ae` drives it with `std.guest` as
+  `rexx/host.ae` drives RexxAE's. It locks itself down the same way
+  (`child.run`), before the first JavaScript runs, and is spawned with no
+  grants. What is left in `worker.ae` is engine glue: the ROM's host
+  functions, the mounts as JavaScript, and the interrupt hook.
   - **Its standard library is baked at build time**, as MicroQuickJS does
     it: `js/rom` runs mquickjs-ae's ROM generator (its `gen/genengine`,
     used as a library) on the core-only spec, the language plus
@@ -96,19 +107,19 @@ Python 3.14) with the aether branch above:**
 
 1. **macOS and Windows** containment. Until then `spawn_socket` refuses
    there, and only the uncontained run, by name, works.
-2. **Python has no cancel.** Its host can only kill a quiet guest; a
-   Python guest would need its own `CANCEL` handling to stop politely.
-3. **The host module's home.** `rexxworker` drives two engines now and
-   nothing in it is about Rexx; it wants a neutral name and a place both
-   can take it from (std, or this repo's `lib/`), rather than the JS
-   showcase reaching into RexxAE.
+2. ~~**Python has no cancel.**~~ Done: `python/aether_guest.py` takes the
+   host's `CANCEL` on a reader thread and interrupts the program, so a
+   Python guest stops politely, and is killed only if it does not answer.
+3. ~~**The host module's home.**~~ Done: `std.guest` and `std.guest.child`
+   in Aether's standard library; nothing here reaches into RexxAE for it.
 4. **sae itself** runs pages in its own process. Moving them into a
    worker like `js-worker` would be on quickjs-ng (`contrib.quickjs`,
    whose time limit is the same hook), not on mquickjs-ae.
 
 ## Run it
 
-You need Aether 0.873.0 or later (`ae upgrade`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
+You need an Aether with `std.guest` (until it is released, an Aether tree
+built from the branch that adds it, passed as `AE` and `AETHER_HOME`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
 this one (`../RexxAE`) and `python3` (3.9 or newer). For `make js`, also an
 [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
 points at) and `aeb` (v0.333 or later), which builds `js-worker` as it
@@ -124,8 +135,8 @@ make js-test
 To use an Aether tree other than the one on `PATH`, pass both
 `AE=/path/to/aether/build/ae` and `AETHER_HOME=/path/to/aether`.
 
-`make python` runs the conversation, then a guest that goes quiet (killed
-at the deadline, 5 s). `make rexx` builds RexxAE's worker, runs the
+`make python` runs the conversation, then a guest that goes quiet
+(cancelled at the deadline, 5 s, in the middle of a `time.sleep`). `make rexx` builds RexxAE's worker, runs the
 conversation, then a script stuck in `HOST_HEAR` (cancelled at the
 deadline). `make js` builds `js-worker`, runs the conversation, then a
 script in `while (true)` (cancelled at the deadline), a worker that never
@@ -139,7 +150,8 @@ spawn refused: sandbox.spawn_socket: cannot contain a child on macOS, so nothing
 and `make python UNCONTAINED=1` (or `rexx`) runs them with no process
 sandbox, saying so on every run.
 
-Tested contained on CachyOS (x86_64, Linux 7.3, Python 3.14), and
+Tested contained on CachyOS (x86_64, Linux 7.3, Python 3.14) and, on
+`std.guest`, on Ubuntu 22.04 (x86_64, Linux 5.15, Python 3.10), and
 uncontained on macOS (arm64, Python 3.9).
 
 `js/mqjs` is a relative symlink to `../../mquickjs-ae`, with `js/ae` and
@@ -180,8 +192,7 @@ audit log, and the guests that stall:
   rexx -> host  PROBE ADDRESS SYSTEM cat /etc/passwd: RC 1
   ...
   host -> python-stall  ASK multiply 6 7
-conversation ended: guest went quiet or broke the framing: timed out: no message within 5000 ms
-  host: guest killed
+  worker: ERROR cancelled by host: deadline of 5000 ms passed
   ...
   host -> rexx-stuck  HELLO from the Aether host
   rexx-stuck -> host  SAY waiting for a second message, which never comes
@@ -233,8 +244,8 @@ python GRANT config -> data/config.txt
 python DENY /etc/passwd: not in policy
 --- session: python-stall
 SPAWN python3 (sandbox.spawn_socket)
-python-stall TIMEOUT or bad frame: timed out: no message within 5000 ms
-python-stall KILLED after: guest went quiet or broke the framing: timed out: no message within 5000 ms
+python-stall TIMEOUT no frame within 5000 ms; CANCEL sent
+python-stall ERROR cancelled by host: deadline of 5000 ms passed
 --- session: rexx
 rexx SPAWN ../RexxAE/build/worker/rexxae-worker (sandbox.spawn_socket)
 rexx reports: rexxae-worker locked itself down before the first step: no grants
@@ -289,19 +300,25 @@ code.
 
 ## What a developer writes
 
+All three hosts are the same program with other names: they drive their
+guest with Aether's `std.guest`.
+
 **The Python host** (`python/host.ae`):
 
 ```aether
-guest = sandbox.new("python-guest") {
+perms = sandbox.new("python-guest") {
     grant_runtime("python3")                     // asked of python3 itself
     grant_fs_read("${os.getcwd()}/python/guest.py")
+    grant_fs_read("${os.getcwd()}/python/aether_guest.py")
 }
 policy = |name: string| {                        // what the guest may ask for
     if name == "config" { return "data/config.txt" }
     return ""
 }
-ch, pid, err = childbox.start_guest(guest, "python3", argv, 0)   // spawn_socket
-cerr = childbox.converse(ch, "python", policy)   // every wait has a deadline
+w, err = guest.launch(perms, "python3", argv, "python", childbox.AUDIT_LOG)   // -I python/guest.py
+guest.mount(&w, "host_hear", 0, 0)               // and host_tell, host_request
+guest.start(&w, "chat")
+e = guest.next(&w)                               // SAY, CALL, DONE, ERROR, KILLED
 ```
 
 There are two kinds of permission, and they are kept apart on purpose:
@@ -313,34 +330,35 @@ There are two kinds of permission, and they are kept apart on purpose:
 
 Both kinds end up in the one audit log.
 
-**The Rexx host** (`rexx/host.ae`) drives RexxAE's worker through its host
-module, `rexxworker`, built with `--lib ../RexxAE/worker`:
+**The Rexx host** (`rexx/host.ae`) drives RexxAE's worker:
 
 ```aether
-guest = sandbox.new("rexx-guest") {}             // the worker needs nothing
-w, err = rexxworker.launch(guest, prog, "rexx", childbox.AUDIT_LOG)
-rexxworker.mount(&w, "HOST_HEAR", 0, 0)          // and HOST_TELL, HOST_REQUEST
-rexxworker.start(&w, source)
-e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILLED
+perms = sandbox.new("rexx-guest") {}             // the worker needs nothing
+w, err = guest.launch(perms, prog, null, "rexx", childbox.AUDIT_LOG)
+guest.mount(&w, "HOST_HEAR", 0, 0)               // and HOST_TELL, HOST_REQUEST
+guest.start(&w, source)
+e = guest.next(&w)                               // SAY, CALL, DONE, ERROR, KILLED
 ```
 
-**The JavaScript host** (`js/host.ae`) is the Rexx host with other
-names. `js-worker` speaks RexxAE's worker protocol, so the same module
-drives it:
+**The JavaScript host** (`js/host.ae`) is the Rexx host with other names:
 
 ```aether
-guest = sandbox.new("js-guest") {}               // the worker needs nothing
-w, err = rexxworker.launch(guest, "js/target/build/bin/js-worker", "js", childbox.AUDIT_LOG)
-rexxworker.mount(&w, "hostHear", 0, 0)           // and hostTell, hostRequest
-rexxworker.start(&w, source)
-e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILLED
+perms = sandbox.new("js-guest") {}               // the worker needs nothing
+w, err = guest.launch(perms, "js/target/build/bin/js-worker", null, "js", childbox.AUDIT_LOG)
+guest.mount(&w, "hostHear", 0, 0)                // and hostTell, hostRequest
+guest.start(&w, source)
+e = guest.next(&w)                               // SAY, CALL, DONE, ERROR, KILLED
 ```
 
 **The guests**, in their own languages:
 
-- **Python** (`python/guest.py`): plain `socket` on the descriptor named in
-  `AETHER_IPC_FD`, the 4-byte frame header, and `socket.recv_fds` to take
-  a granted file.
+- **Python** (`python/guest.py`): `aether_guest.open("python-guest").run(main)`,
+  and the three mounted functions as Python callables:
+  `g.function("host_request")("config")` returns `{"granted": True, "text":
+  ...}` or `{"granted": False, "why": ...}`. `python/aether_guest.py` is the
+  Python twin of `std.guest.child`, standard library only: frames on the
+  descriptor named in `AETHER_IPC_FD`, `socket.recv_fds` for a granted file,
+  and a reader thread for `CANCEL`.
 - **Rexx** (`rexx/chat.rexx`): RexxAE has no system API of its own. The
   host mounts three functions in the worker, `HOST_HEAR()`,
   `HOST_TELL(line)` and `HOST_REQUEST(name)`, and each is a frame on the
@@ -352,9 +370,10 @@ e = rexxworker.next(&w)                          // SAY, CALL, DONE, ERROR, KILL
   object, `{granted: true, text: ...}` or `{granted: false, why: ...}`.
   `print` and `console.log` are `SAY` lines.
 
-**The shared part** (`lib/childbox`): the spawn, the frames with their
-deadline, the descriptor hand-over, the host's half of the conversation, the
-audit log and escaping.
+**The shared part** is Aether's `std.guest` (the spawn, the frames with
+their deadline, cancel and kill, the descriptor hand-over, escaping, the
+audit log's lines) and, for the showcase, `lib/childbox`: what the host
+says in the conversation, which is the same for every guest.
 
 ## The API
 
@@ -377,7 +396,7 @@ would allow, from its code:
 | Python `ctypes.CDLL` of libc by its absolute path | skipped (Linux only) | refused | refused (the preload) |
 | Python raw `syscall(openat)` via ctypes, libc's `syscall` found in its symbol table in memory | skipped (Linux only) | **ALLOWED** | refused (Permission denied: Landlock) |
 | Python `connect` 1.1.1.1:443 | ALLOWED | refused | refused (Operation not permitted: seccomp) |
-| Python guest silent after HELLO | killed at the deadline | killed | killed at the deadline (5 s) |
+| Python guest silent after HELLO (in `time.sleep`) | `cancelled by host` at the deadline | `cancelled by host` | `cancelled by host` at the deadline (5 s) |
 | Rexx `ADDRESS SYSTEM` | RC 1 | RC 1 | RC 1 (the engine's own wall) |
 | Rexx worker `fs.read` / `tcp.connect` | refused | refused | refused (the worker's own enforce) |
 | Rexx script waiting in `HOST_HEAR` | `cancelled by host` at the deadline | `cancelled by host` | `cancelled by host` at the deadline (5 s) |
@@ -462,7 +481,7 @@ short:
   link, with a clear message naming both versions. Hence the note under
   "Run it".
 - The guest-supplied request name was printed unescaped (Adil's catch);
-  everything from a guest now goes through `childbox.printable`.
+  everything from a guest now goes through `guest.printable`.
 - The preload replaces libc's `syscall()` and refuses it outright when
   sandboxed, so a raw-syscall probe written in C has to use the
   instruction itself (`js/rom.c`), as the Python one finds `syscall` in

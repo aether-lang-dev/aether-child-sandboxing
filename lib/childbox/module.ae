@@ -1,124 +1,7 @@
-// childbox: what an Aether host needs to talk to a guest it has put in a
-// sandboxed child process (sandbox.spawn_socket). Shared by the Python and
-// the RexxAE showcase.
-//
-// Four parts:
-//   - start_guest: sandbox.spawn_socket, failing closed, or, only when the host
-//     asks for it by name, sandbox.spawn_socket_uncontained.
-//   - Wire: std.ipc's length-prefixed frames (a 4-byte big-endian length,
-//     then the bytes, at most MAX_FRAME), each read bounded by a deadline,
-//     and a granted file handed over as an open descriptor.
-//   - The host's half of the showcase conversation, the same for every
-//     guest language: respond (what the host says to a guest's line) and
-//     converse (the whole exchange over frames, for a guest that speaks them
-//     itself, such as python/guest.py).
-//   - audit_log: one log for both kinds of permission, the host's GRANTs
-//     and DENYs, timeouts and kills, and what the guest's own sandbox
-//     reports.
-
-exports(start_guest, tell, hear, grant_fd, respond, converse, audit_log, printable,
-        show, split_verb, MAX_FRAME, DEADLINE_MS, AUDIT_LOG)
-
-import std.io
-import std.ipc
-import std.list
-import std.os
-import std.sandbox
-import std.string
-
-// The largest message either side accepts. A peer that announces more is
-// cut off before a byte of it is buffered.
-const MAX_FRAME = 65536
-// The longest the host waits for the guest's next message.
-const DEADLINE_MS = 5000
-
-const AUDIT_LOG = "build/audit.log"
-
-// Starts `prog` held to `perms`. Fails closed: where the child cannot be
-// contained (macOS, Windows; Linux without Landlock) it returns the reason
-// and starts nothing. With `uncontained` = 1, which a host sets only when
-// asked to by name (make ... UNCONTAINED=1), it runs the child with no
-// process sandbox, and says so on every run.
-start_guest(perms: sandbox.Grants, prog: string, argv: ptr, uncontained: int) -> (int, int, string) {
-    if uncontained == 1 {
-        println("[childbox] sandbox.spawn_socket_uncontained: the guest runs with NO process sandbox")
-        audit_log("SPAWN ${prog} UNCONTAINED (asked for by name)")
-        return sandbox.spawn_socket_uncontained(perms, prog, argv, null)
-    }
-    ch, pid, err = sandbox.spawn_socket(perms, prog, argv, null)
-    if err != "" {
-        audit_log("SPAWN ${prog} refused: ${err}")
-        return ch, pid, err
-    }
-    audit_log("SPAWN ${prog} (sandbox.spawn_socket)")
-    return ch, pid, ""
-}
-
-// Sends one message as one frame.
-tell(ch: int, msg: string) -> string {
-    return ipc.write_frame(ch, msg)
-}
-
-// The next message, waiting at most `deadline_ms` for it to start and to
-// finish. ("", "timed out ...") when the guest stays silent; ("", err) for a
-// frame over MAX_FRAME, a stall part way, or end of stream. After any error
-// the stream is out of step: hang up.
-hear(ch: int, deadline_ms: int) -> (string, string) {
-    ready, werr = ipc.wait_readable(ch, deadline_ms)
-    if werr != "" { return "", werr }
-    if ready == 0 { return "", "timed out: no message within ${deadline_ms} ms" }
-    return ipc.read_frame_timeout(ch, MAX_FRAME, deadline_ms)
-}
-
-// Hands the guest an open descriptor: a GRANT frame, then the descriptor on
-// the next byte. The guest reads the frame exactly (std.ipc's read_frame
-// never reads past it), then receives the byte and the descriptor in one
-// recvmsg (ipc.recv, or Python's socket.recv_fds). No TAKE step.
-grant_fd(ch: int, name: string, fd: int) -> string {
-    err = tell(ch, "GRANT ${name}")
-    if err != "" { return err }
-    return ipc.send_fd(ch, fd, "F")
-}
-
-// Records one permission decision. Both kinds land here, in one file: the
-// host's answers to the guest's requests (GRANT, DENY), timeouts and kills,
-// and what the guest reports from its own sandbox (AUDIT messages). Lines
-// that came from the guest say so, and are escaped, since a guest chooses
-// their bytes.
-audit_log(event: string) {
-    err = io.append_file(AUDIT_LOG, "${event}\n")
-    if err != "" { println("[childbox] audit log ${AUDIT_LOG}: ${err}") }
-}
-
-// `s` safe to print or log: control bytes and backslashes as \xNN, so a
-// guest cannot forge a line or send escape sequences to a terminal.
-printable(s: string) -> string {
-    hex = "0123456789abcdef"
-    out = ""
-    seg = 0
-    i = 0
-    n = string.length(s)
-    while i < n {
-        c = string.char_at(s, i)
-        if c >= 0 && (c < 32 || c == 127 || c == 92) {
-            out = string.concat(out, string.substring(s, seg, i))
-            hi = c / 16
-            lo = c % 16
-            out = string.concat(out, "\\x${string.substring(hex, hi, hi + 1)}${string.substring(hex, lo, lo + 1)}")
-            seg = i + 1
-        }
-        i = i + 1
-    }
-    return string.concat(out, string.substring(s, seg, n))
-}
-
-// Prints one message of the conversation with its direction. Everything a
-// guest sent goes through printable first.
-show(from: string, to: string, line: string) {
-    println("  ${from} -> ${to}  ${printable(line)}")
-}
-
-// The host's side of the showcase, the same for every guest:
+// childbox: the showcase's conversation, the same for every guest language.
+// The transport, the deadlines, the descriptor hand-over, cancel and kill
+// and the audit log's lines about them are Aether's std.guest; what is here
+// is what the host says, and the one audit log all three showcases share.
 //
 //   host  HELLO              guest HELLO
 //   host  ASK multiply 6 7   guest ANSWER 42
@@ -126,94 +9,115 @@ show(from: string, to: string, line: string) {
 //                            guest SAY <from the file>
 //                            guest REQUEST /etc/passwd  host DENY
 //                            guest PROBE <its own escape attempts>
-//                            guest AUDIT <its sandbox's own record>
 //                            guest DONE
 //   host  BYE                guest BYE
 //
-// respond: what the host says to one line from the guest (REQUEST aside,
-// which needs the transport). Adds the host's answers to `out`, a std.list
-// of strings, shown as they are decided; 1 when the guest has said BYE.
-respond(guest: string, line: string, out: ptr) -> int {
-    show(guest, "host", line)
-    verb, rest = split_verb(line)
+// Each guest has three functions the host mounts, named in its language's
+// style (HOST_HEAR, hostHear, host_hear): hear (the host's next message),
+// tell (a message to the host) and request (ask for a file by name).
+
+exports(converse, respond, show, audit_log, AUDIT_LOG)
+
+import std.io
+import std.json
+import std.list
+import std.string
+import std.guest
+
+const AUDIT_LOG = "build/audit.log"
+
+// A line in the shared audit log (std.guest writes its own there too).
+audit_log(line: string) {
+    io.append_file(AUDIT_LOG, "${line}\n")
+}
+
+// Prints one message of the conversation with its direction. Everything a
+// guest sent goes through guest.printable first.
+show(from: string, to: string, line: string) {
+    println("  ${from} -> ${to}  ${guest.printable(line)}")
+}
+
+// What the host says to one line the guest told it: adds the host's
+// answers to `out`, a std.list of strings, shown as they are decided.
+respond(session: string, line: string, out: ptr) {
+    show(session, "host", line)
+    verb, _ = split_verb(line)
     if verb == "HELLO" {
-        show("host", guest, "ASK multiply 6 7")
+        show("host", session, "ASK multiply 6 7")
         list.add(out, "ASK multiply 6 7")
-    } else if verb == "AUDIT" {
-        audit_log("${guest} reports: ${printable(rest)}")
     } else if verb == "DONE" {
-        show("host", guest, "BYE")
+        show("host", session, "BYE")
         list.add(out, "BYE")
-    } else if verb == "BYE" {
-        return 1
     }
-    return 0
 }
 
-// The whole conversation with a guest that speaks frames itself. Every wait
-// for the guest is bounded by DEADLINE_MS; a guest that stays silent past it,
-// or breaks the framing, ends the conversation with an error (the caller
-// hangs up and kills it). `policy` maps a name the guest may ask for to a
-// path on the host's disk, or "" for no.
-converse(ch: int, guest: string, policy: fn) -> string {
+// The whole conversation with a guest that has mounted `hear`, `tell` and
+// `request` and been started. `policy` maps a name the guest may ask for
+// to a path on the host's disk, or "" for no. Ends at the guest's DONE,
+// ERROR or KILLED, which it prints.
+converse(g: *guest.Guest, session: string, hear: string, tell: string, request: string, policy: fn) {
+    println("conversation (permission decisions also go to ${AUDIT_LOG}):")
+    // What the host has to say, waiting for the guest's next hear.
+    outbox = list.new()
+    defer list.free(outbox)
     hello = "HELLO from the Aether host"
-    show("host", guest, hello)
-    err = tell(ch, hello)
-    if err != "" { return err }
-    out = list.new()
-    defer list.free(out)
+    show("host", session, hello)
+    list.add(outbox, hello)
     while true {
-        line, rerr = hear(ch, DEADLINE_MS)
-        if rerr != "" {
-            audit_log("${guest} TIMEOUT or bad frame: ${rerr}")
-            return "guest went quiet or broke the framing: ${rerr}"
-        }
-        verb, rest = split_verb(line)
-        if verb == "REQUEST" {
-            show(guest, "host", line)
-            err = answer_request(ch, guest, rest, policy)
-            if err != "" { return err }
-        } else {
-            list.clear(out)
-            done = respond(guest, line, out)
-            n = list.size(out)
-            i = 0
-            while i < n {
-                item, _ = list.get_string(out, i)
-                err = tell(ch, item)
-                if err != "" { return err }
-                i = i + 1
+        e = guest.next(g)
+        if e.kind == "CALL" {
+            arg = first_arg(e.text)
+            if e.name == hear {
+                if list.size(outbox) > 0 {
+                    line, _ = list.get_string(outbox, 0)
+                    list.remove(outbox, 0)
+                    guest.answer(g, guest.json_string(line))
+                }
+                // Nothing to say: no answer. The deadline decides.
+            } else if e.name == tell {
+                respond(session, arg, outbox)
+                guest.answer(g, "true")
+            } else if e.name == request {
+                show(session, "host", "REQUEST ${arg}")
+                string path = policy(arg)
+                if path == "" {
+                    show("host", session, "DENY ${arg}: not in this guest's policy")
+                    guest.deny(g, arg, "not in this guest's policy")
+                } else {
+                    show("host", session, "GRANT ${arg}   (then ${path} as an open descriptor)")
+                    guest.grant_file(g, arg, path)
+                }
+            } else {
+                guest.fail(g, "${e.name} is not served here")
             }
-            if done == 1 { return "" }
+        } else if e.kind == "SAY" {
+            show(session, "host", "SAY ${e.text}")
+        } else if e.kind == "DONE" {
+            println("  worker: done, exit ${e.code}")
+            return
+        } else if e.kind != "LOG" {
+            println("  worker: ${e.kind} ${guest.printable(e.text)}")
+            return
         }
     }
 }
 
-// GRANT and pass the file, or DENY.
-answer_request(ch: int, guest: string, name: string, policy: fn) -> string {
-    string path = policy(name)
-    if path == "" {
-        deny = "DENY ${name}: not in this guest's policy"
-        audit_log("${guest} DENY ${printable(name)}: not in policy")
-        show("host", guest, deny)
-        return tell(ch, deny)
+// The one argument in a JSON array of arguments, as text.
+fn first_arg(args: string) -> string {
+    v, perr = json.parse(args)
+    if perr != "" { return "" }
+    el, aerr = json.array_get(v, 0)
+    text = ""
+    if aerr == "" {
+        s, gerr = json.get_string(el)
+        if gerr == "" { text = s }
     }
-    fd, oerr = io.fd_open_read(path)
-    if oerr != "" {
-        deny = "DENY ${name}: ${oerr}"
-        audit_log("${guest} DENY ${printable(name)}: ${oerr}")
-        show("host", guest, deny)
-        return tell(ch, deny)
-    }
-    audit_log("${guest} GRANT ${printable(name)} -> ${path}")
-    show("host", guest, "GRANT ${name}   (then ${path} as an open descriptor)")
-    err = grant_fd(ch, name, fd)
-    io.fd_close(fd)
-    return err
+    json.json_free(v)
+    return text
 }
 
 // "VERB the rest" -> ("VERB", "the rest").
-split_verb(line: string) -> (string, string) {
+fn split_verb(line: string) -> (string, string) {
     at = string.index_of(line, " ")
     if at < 0 { return line, "" }
     return string.substring(line, 0, at), string.substring(line, at + 1, string.length(line))
