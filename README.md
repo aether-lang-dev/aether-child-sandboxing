@@ -1,14 +1,14 @@
 # aether-child-sandboxing
 
-> **Status: needs an Aether with `std.guest` (the PR adding it to Aether;
-> the first release after 0.875.0).** All three guests run on the real calls,
+> **Status: needs Aether 0.878.0 or later, the first release with
+> `std.guest`.** All three guests run on the real calls,
 > `sandbox.spawn_socket` and `std.ipc`'s frames (Aether 0.873.0, through
 > [aether#3510](https://github.com/aether-lang-dev/aether/pull/3510)), and
 > all three hosts drive their guest with Aether's `std.guest`; the Aether
 > workers (RexxAE's and `js-worker`) are built on `std.guest.child`, and the
 > Python guest speaks the same protocol through `python/aether_guest.py`.
 > The Rexx worker is [RexxAE](https://github.com/aether-lang-dev/RexxAE)'s
-> (its `std.guest.child` move is a local commit until that Aether release);
+> (on `std.guest.child` since its 0.878.0 pin);
 > the JavaScript worker uses [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae)'s `main`. Discussion and
 > decisions: [aether#3503](https://github.com/aether-lang-dev/aether/issues/3503).
 
@@ -43,7 +43,7 @@ nothing. Running a guest uncontained is asked for by name
 ## What's coded, what's left
 
 **Coded, and observed working on CachyOS (Linux 7.3, Landlock in `lsm=`,
-Python 3.14) with the aether branch above:**
+Python 3.14) with an Aether tree that had `std.guest` (the 0.878.0 release has it):**
 
 - `sandbox.spawn_socket` for both guests, failing closed. The Python guest
   gets `grant_runtime("python3")` (its library, asked of python3 itself, no
@@ -118,8 +118,7 @@ Python 3.14) with the aether branch above:**
 
 ## Run it
 
-You need an Aether with `std.guest` (until it is released, an Aether tree
-built from the branch that adds it, passed as `AE` and `AETHER_HOME`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
+You need Aether 0.878.0 or later (the first release with `std.guest`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
 this one (`../RexxAE`) and `python3` (3.9 or newer). For `make js`, also an
 [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
 points at) and `aeb` (v0.333 or later), which builds `js-worker` as it

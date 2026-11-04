@@ -1,5 +1,5 @@
-# Needs an Aether with std.guest and std.guest.child (not in a release yet:
-# set AE and AETHER_HOME to an Aether tree that has them). AE defaults to the
+# Needs Aether 0.878.0 or later (std.guest and std.guest.child first ship in
+# 0.878.0; the floor is evidence-based). AE defaults to the
 # ae on PATH, AETHER_HOME to your environment's (an installed release sets it).
 # RexxAE's worker and the programs here are built by the same ae.
 #
