@@ -50,7 +50,7 @@ js: build/js-host $(JS_WORKER) $(SILENT)
 	-./build/js-host $(JS_WORKER) big $(MODE)
 
 js-test: build/js-test $(JS_WORKER) $(SILENT)
-	./build/js-test
+	JS_TEST_SILENT=$(abspath $(SILENT)) ./build/js-test
 
 build/python-host: python/host.ae lib/childbox/module.ae | build-dir
 	$(AE) build python/host.ae --lib lib -o $@

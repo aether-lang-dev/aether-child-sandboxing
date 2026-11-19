@@ -14,7 +14,10 @@ import std.string
 import std.guest
 
 const WORKER = "js/target/build/bin/js-worker"
-const SILENT = "../RexxAE/build/worker/silent"
+// RexxAE's stand-in for a worker that has stopped. The Makefile builds it in
+// its REXXAE checkout and says where in JS_TEST_SILENT; the default is the
+// sibling checkout.
+const SILENT_DEFAULT = "../RexxAE/build/worker/silent"
 const LOG = "build/js-test-audit.log"
 
 // The worker, contained where spawn_socket can contain it.
@@ -185,7 +188,9 @@ main() {
             spec.assert_contains(e.text, "SyntaxError", "named")
         }
         spec.it("kills a worker that never answers, CANCEL included") callback {
-            w = begin(SILENT, "silent")
+            silent = os.getenv("JS_TEST_SILENT")
+            if silent == "" { silent = SILENT_DEFAULT }
+            w = begin(silent, "silent")
             w.deadline_ms = 200
             w.grace_ms = 200
             guest.start(&w, "print('never runs')")
