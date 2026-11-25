@@ -120,7 +120,7 @@ Python 3.14) with an Aether tree that had `std.guest` (the 0.878.0 release has i
 
 You need Aether 0.878.0 or later (the first release with `std.guest`), a [RexxAE](https://github.com/aether-lang-dev/RexxAE) checkout next to
 this one (`../RexxAE`, or `REXXAE=/path`; it is built by the same `ae`, and its
-current pin is Aether 0.941.0, which is what this was last run on) and `python3` (3.9 or newer). For `make js`, also an
+current pin is Aether 0.944.0, which is what this was last run on (a tracking-only move from 0.941.0: 0.942.0 to 0.944.0 are performance only, no source change)) and `python3` (3.9 or newer). For `make js`, also an
 [mquickjs-ae](https://github.com/aether-lang-dev/mquickjs-ae) checkout next to this one (`../mquickjs-ae`, which `js/mqjs`
 points at) and `aeb` (v0.333 or later), which builds `js-worker` as it
 builds mquickjs-ae, with the engine compiled by the same Aether tree.
